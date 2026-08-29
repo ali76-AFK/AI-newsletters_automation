@@ -47,7 +47,7 @@ def make_article(
     body: str,
 ) -> NewsArticle:
     return NewsArticle(
-        source="Spiegel",
+        source="spiegel_wissenschaft_technik",
         external_id="test-id",
         url="https://www.spiegel.de/wissenschaft/technik/test.html",
         published_at="2026-08-20T10:00:00Z",
@@ -121,7 +121,7 @@ def test_fetch_rss_articles_filters_allowlisted_feed_by_topic():
         return_value=response,
     ):
         articles = fetch_rss_articles(
-            source="Spiegel",
+            source="spiegel_wissenschaft_technik",
             topic="ai_news",
         )
 
@@ -136,7 +136,7 @@ def test_fetch_rss_articles_rejects_topic_without_allowlisted_feed():
         match="not allowlisted",
     ):
         fetch_rss_articles(
-            source="Spiegel",
+            source="spiegel_wissenschaft_technik",
             topic="business",
         )
 
@@ -145,12 +145,12 @@ def test_get_articles_uses_stub_mode(monkeypatch):
     monkeypatch.setenv("NEWS_SOURCE_MODE", "stub")
 
     articles = get_articles(
-        source="Spiegel",
+        source="spiegel_wissenschaft_technik",
         topic="ai_news",
     )
 
     assert len(articles) == 3
-    assert all(article.source == "Spiegel" for article in articles)
+    assert all(article.source == "spiegel_wissenschaft_technik" for article in articles)
 
 
 def test_get_articles_rejects_unknown_mode(monkeypatch):
@@ -161,6 +161,48 @@ def test_get_articles_rejects_unknown_mode(monkeypatch):
         match="Unsupported NEWS_SOURCE_MODE",
     ):
         get_articles(
-            source="Spiegel",
+            source="spiegel_wissenschaft_technik",
             topic="ai_news",
         )
+
+
+def test_get_articles_stub_mode_business(monkeypatch):
+    """Stub mode returns articles for business topic."""
+    monkeypatch.setenv("NEWS_SOURCE_MODE", "stub")
+
+    articles = get_articles(
+        source="spiegel_wirtschaft",
+        topic="business",
+    )
+
+    assert len(articles) == 3
+    assert all(article.source == "spiegel_wirtschaft" for article in articles)
+    assert all(article.topic == "business" for article in articles)
+
+
+def test_get_articles_stub_mode_world_news_ausland(monkeypatch):
+    """Stub mode returns articles for world_news from ausland source."""
+    monkeypatch.setenv("NEWS_SOURCE_MODE", "stub")
+
+    articles = get_articles(
+        source="spiegel_ausland",
+        topic="world_news",
+    )
+
+    assert len(articles) == 3
+    assert all(article.source == "spiegel_ausland" for article in articles)
+    assert all(article.topic == "world_news" for article in articles)
+
+
+def test_get_articles_stub_mode_world_news_politik(monkeypatch):
+    """Stub mode returns articles for world_news from politik source."""
+    monkeypatch.setenv("NEWS_SOURCE_MODE", "stub")
+
+    articles = get_articles(
+        source="spiegel_politik",
+        topic="world_news",
+    )
+
+    assert len(articles) == 3
+    assert all(article.source == "spiegel_politik" for article in articles)
+    assert all(article.topic == "world_news" for article in articles)
