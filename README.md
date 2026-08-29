@@ -3,23 +3,41 @@
 Local-first, scheduled AI newsletter orchestration with FastAPI, Streamlit,
 PostgreSQL, LangGraph workflows, Mailpit, and selectable AI providers.
 
-## Current MVP
+## Current status: RSS foundation complete
 
-The project currently supports:
+The project now supports:
 
-- Subscriber and topic management.
-- Delivery schedule configuration.
-- Newsletter creation and recipient drafts.
-- AI classification, summarization, and draft refinement.
-- Bounded LangGraph newsletter workflow execution.
-- Human review for high and critical content.
-- Automation controls, duplicate prevention, cooldowns, and daily limits.
-- PostgreSQL persistence.
-- Mock email delivery through Mailpit.
-- Mock, Ollama, and Groq AI-provider modes.
+- **Subscriber and topic management** (8 topics: `ai_news`, `robotics`, `data_eng`, `devops`, `llm_workflows`, `technology_science`, `business`, `world_news`).
+- **Delivery schedule configuration** with manual and automated execution modes.
+- **RSS ingestion foundation**:
+  - Allowlisted HTTPS sources with bounded fetch (15 entries max, timeout, size limit).
+  - Deterministic topic relevance filtering (keyword-based for technical topics, broad routing for `technology_science`, `business`, `world_news`).
+  - 4 RSS sources: `spiegel_wissenschaft_technik`, `spiegel_wirtschaft`, `spiegel_ausland`, `spiegel_politik`.
+  - Stub articles for all 8 topics (demo/testing without live RSS).
+- **Newsletter creation and recipient drafts**.
+- **AI classification, summarization, and draft refinement** (mock, Ollama, or Groq).
+- **Bounded LangGraph newsletter workflow execution**.
+- **Human review for high and critical content**.
+- **Automation controls**: duplicate prevention, cooldowns (15 min), daily limits (3 sends).
+- **PostgreSQL persistence** for all state (subscribers, schedules, newsletters, drafts, automation state).
+- **Mock email delivery** through Mailpit.
 
-The current source ingestion implementation uses deterministic local articles for
-development and demos.
+### Test coverage
+
+- 30 backend tests passing (full suite).
+- Stub-mode tests for all 8 topics.
+- RSS allowlist tests for all 4 sources.
+
+### Path to full AI automation
+
+The RSS foundation enables the next phase: **end-to-end AI-driven automation**.
+
+Planned capabilities:
+
+- **AI-driven content selection**: Replace deterministic keyword filtering with LLM-based relevance scoring.
+- **Automated scheduling**: Cron/scheduler integration for periodic RSS polling.
+- **AI workflow orchestration**: Fully automated pipeline from content ingestion → classification → draft generation → review (when needed) → send.
+- **Observability**: Source health metrics, error tracking, run-history analytics.
 
 ## Important safety model
 

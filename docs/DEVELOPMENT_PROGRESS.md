@@ -182,3 +182,34 @@ The SPIEGEL science/technology RSS feed currently supports:
 
 `business` and `world_news` are valid subscriber topics but require dedicated
 allowlisted feeds before RSS-mode scheduled delivery can use them.
+
+## 2026-08-29 — RSS foundation completion: business & world-news feeds
+
+### Completed
+
+- Normalized `RSS_SOURCE_ALLOWLIST` to `source → topic → URL` structure.
+- Added stub articles for `business` (3 articles) and `world_news` (6 articles across `spiegel_ausland` and `spiegel_politik`).
+- Added test coverage for all new sources/topics (12 news-ingestion tests total).
+- Updated all references from old `"Spiegel"` source name to `"spiegel_wissenschaft_technik"`.
+- Migrated repository to new remote (`AI-newsletters_automation`) to avoid merge conflicts.
+
+### Current feed coverage
+
+| Source | Topics |
+|---|---|
+| `spiegel_wissenschaft_technik` | `ai_news`, `robotics`, `data_eng`, `devops`, `llm_workflows`, `technology_science` |
+| `spiegel_wirtschaft` | `business` |
+| `spiegel_ausland` | `world_news` |
+| `spiegel_politik` | `world_news` |
+
+### Test coverage
+
+- 30 backend tests passing (full suite).
+- Stub-mode tests for all 8 topics.
+- RSS allowlist tests for all 4 sources.
+
+### Next steps toward full automation
+
+- **AI-driven content selection**: Replace deterministic keyword filtering with LLM-based relevance scoring.
+- **Automated scheduling**: Cron/scheduler integration for periodic RSS polling.
+- **AI workflow orchestration**: End-to-end automation from content ingestion → classification → draft generation → review (when needed) → send.
