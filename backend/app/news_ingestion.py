@@ -367,10 +367,34 @@ def _keyword_matches(
 def is_relevant_for_topic(
     article: NewsArticle,
     topic: str,
+    settings: Settings | None = None,
 ) -> bool:
+    """
+    Check if article is relevant to topic using AI scoring.
+
+    For technology_science, always return True (broad routing).
+    For other topics, use AI relevance scorer if settings provided,
+    otherwise fall back to keyword matching for backward compatibility.
+    """
     if topic == "technology_science":
         return True
 
+    # Use AI scoring if settings provided
+    if settings is not None:
+        from .ai_relevance_scorer import score_article_relevance
+
+        result = score_article_relevance(
+            title=article.title,
+            body=article.body,
+            topic=topic,
+            settings=settings,
+        )
+
+        # Default threshold: 0.7
+        threshold = getattr(settings, "relevance_threshold", 0.7)
+        return result["score"] >= threshold
+
+    # Fallback to keyword matching for backward compatibility
     keywords = TOPIC_KEYWORDS.get(topic)
 
     if keywords is None:
@@ -387,11 +411,12 @@ def is_relevant_for_topic(
 def filter_relevant_articles(
     articles: list[NewsArticle],
     topic: str,
+    settings: Settings | None = None,
 ) -> list[NewsArticle]:
     return [
         article
         for article in articles
-        if is_relevant_for_topic(article, topic)
+        if is_relevant_for_topic(article, topic, settings)
     ]
 
 
@@ -400,6 +425,7 @@ def fetch_rss_articles(
     topic: str,
 ) -> list[NewsArticle]:
     feed_url = _validated_rss_url(source, topic)
+    settings = load_settings()
 
     try:
         response = requests.get(
@@ -467,7 +493,7 @@ def fetch_rss_articles(
             )
         )
 
-    return filter_relevant_articles(articles, topic)
+    return filter_relevant_articles(articles, topic, settings)
 
 
 def get_articles(

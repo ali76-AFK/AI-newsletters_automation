@@ -26,6 +26,9 @@ class Settings(BaseModel):
     email_mode: str = Field(default="mock")
     news_source_mode: str = Field(default="stub")
 
+    # AI relevance scoring
+    relevance_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+
     @property
     def sqlalchemy_dsn(self) -> str:
         return (
