@@ -26,8 +26,9 @@ class Settings(BaseModel):
     email_mode: str = Field(default="mock")
     news_source_mode: str = Field(default="stub")
 
-    # AI relevance scoring
-    relevance_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    # AI workflow configuration
+    workflow_mode: str = Field(default="standard")  # "standard" or "ai"
+    relevance_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
 
     @property
     def sqlalchemy_dsn(self) -> str:
@@ -60,6 +61,7 @@ def load_settings() -> Settings:
                 "NEWS_SOURCE_MODE",
                 "stub",
             ),
+            workflow_mode=os.getenv("WORKFLOW_MODE", "standard"),
         )
     except ValidationError as exc:
         raise RuntimeError(

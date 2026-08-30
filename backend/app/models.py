@@ -239,3 +239,27 @@ class ScheduleRun(Base):
     run_key = Column(String(128), nullable=False, unique=True, index=True)
 
     schedule = relationship("NewsletterSchedule", back_populates="runs")
+
+    @classmethod
+    def get_schedule_runs_by_status(cls, db, schedule_id: int):
+        """Return counts of runs grouped by status for a schedule."""
+        from sqlalchemy import func
+
+        rows = (
+            db.query(cls.status, func.count(cls.id).label("count"))
+            .filter(cls.schedule_id == schedule_id)
+            .group_by(cls.status)
+            .all()
+        )
+        return {status: count for status, count in rows}
+
+    @classmethod
+    def get_recent_runs(cls, db, schedule_id: int, limit: int = 10):
+        """Return the most recent runs for a schedule."""
+        return (
+            db.query(cls)
+            .filter(cls.schedule_id == schedule_id)
+            .order_by(cls.started_at.desc())
+            .limit(limit)
+            .all()
+        )

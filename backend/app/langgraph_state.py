@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel
 
@@ -31,3 +31,8 @@ class WorkflowState(BaseModel):
     subscribers: List[SubscriberState] = []
     created_drafts: List[DraftSummary] = []
     send_summary: Optional[SendSummary] = None
+
+    # AI workflow fields
+    ai_selected_articles: Optional[List[Any]] = None
+    ai_avg_relevance: Optional[float] = None
+    ai_send_decision: Optional[Literal["send", "review", "skip"]] = None

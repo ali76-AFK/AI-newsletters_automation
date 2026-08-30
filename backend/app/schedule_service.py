@@ -13,7 +13,7 @@ from .crud_newsletters import (
 )
 from .models import Newsletter, NewsletterSchedule, ScheduleRun
 from .news_ingestion import NewsArticle, get_articles
-from .routes_workflows import run_newsletter_workflow
+from .routes_workflows import run_newsletter_workflow, run_ai_newsletter_workflow
 from .scheduler_logic import (
     is_schedule_due,
     schedule_delivery_window_key,
@@ -233,10 +233,21 @@ def _run_schedule(
         newsletter.approved = True
         db.flush()
 
-        workflow_result = run_newsletter_workflow(
-            newsletter.id,
-            db=db,
-        )
+        # Use AI workflow if configured
+        from .config import load_settings
+        settings = load_settings()
+        
+        if settings.workflow_mode.lower() == "ai":
+            workflow_result = run_ai_newsletter_workflow(
+                newsletter.id,
+                db=db,
+            )
+        else:
+            workflow_result = run_newsletter_workflow(
+                newsletter.id,
+                db=db,
+            )
+
 
         run.status = "sent"
         run.message = (
