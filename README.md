@@ -1,126 +1,249 @@
-# Newsletter Orchestrator
+# 📧 Newsletter Orchestrator
 
-Local-first, scheduled AI newsletter orchestration with FastAPI, Streamlit,
-PostgreSQL, LangGraph workflows, Mailpit, and selectable AI providers.
+AI-powered newsletter automation with intelligent content curation and automated send decisions.
 
-## Current status: RSS foundation complete
+![Python](https://img.shields.io/badge/Python-3.12+-blue.svg)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)
+![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-The project now supports:
+## 🌟 Features
 
-- **Subscriber and topic management** (8 topics: `ai_news`, `robotics`, `data_eng`, `devops`, `llm_workflows`, `technology_science`, `business`, `world_news`).
-- **Delivery schedule configuration** with manual and automated execution modes.
-- **RSS ingestion foundation**:
-  - Allowlisted HTTPS sources with bounded fetch (15 entries max, timeout, size limit).
-  - Deterministic topic relevance filtering (keyword-based for technical topics, broad routing for `technology_science`, `business`, `world_news`).
-  - 4 RSS sources: `spiegel_wissenschaft_technik`, `spiegel_wirtschaft`, `spiegel_ausland`, `spiegel_politik`.
-  - Stub articles for all 8 topics (demo/testing without live RSS).
-- **Newsletter creation and recipient drafts**.
-- **AI classification, summarization, and draft refinement** (mock, Ollama, or Groq).
-- **Bounded LangGraph newsletter workflow execution**.
-- **Human review for high and critical content**.
-- **Automation controls**: duplicate prevention, cooldowns (15 min), daily limits (3 sends).
-- **PostgreSQL persistence** for all state (subscribers, schedules, newsletters, drafts, automation state).
-- **Mock email delivery** through Mailpit.
+- **Automated Newsletter Generation** - Fetch, filter, and compile news articles
+- **AI-Powered Content Selection** - Score articles by relevance using LLMs
+- **Smart Send Decisions** - Auto-send, review, or skip based on risk + relevance
+- **Flexible Scheduling** - Cron-like delivery with timezone support
+- **Risk Management** - Classify content risk level before sending
+- **Extensible Architecture** - Pluggable AI providers (Groq, Ollama, Mock)
 
-### Test coverage
+## 🚀 Quick Start
 
-- 30 backend tests passing (full suite).
-- Stub-mode tests for all 8 topics.
-- RSS allowlist tests for all 4 sources.
-
-### Path to full AI automation
-
-The RSS foundation enables the next phase: **end-to-end AI-driven automation**.
-
-Planned capabilities:
-
-- **AI-driven content selection**: Replace deterministic keyword filtering with LLM-based relevance scoring.
-- **Automated scheduling**: Cron/scheduler integration for periodic RSS polling.
-- **AI workflow orchestration**: Fully automated pipeline from content ingestion → classification → draft generation → review (when needed) → send.
-- **Observability**: Source health metrics, error tracking, run-history analytics.
-
-## Important safety model
-
-This system does not run an unrestricted AI agent continuously.
-
-A future scheduler will evaluate saved delivery schedules and start a finite,
-bounded workflow only when a schedule is due. AI is used only for specific
-tasks such as classification, summarization, and refinement.
-
-High and critical newsletter content must be reviewed by a human before send.
-
-## Local development
-
-### 1. Start PostgreSQL and Mailpit
+### 1. Clone & Install
 
 ```bash
-cd infrastructure
-cp env/db.env.example env/db.env
-docker compose up -d
+git clone https://github.com/yourusername/newsletter-orchestrator.git
+cd newsletter-orchestrator/backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
 ```
 
-Mailpit UI: `http://127.0.0.1:8025`
-
-### 2. Start the backend
+### 2. Configure
 
 ```bash
-cd backend
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install .
-pip install ".[dev]"
+export APP_ENV=development
+export DB_HOST=127.0.0.1
+export DB_PORT=55432
+export DB_NAME=newsletter
+export DB_USER=newsletter_user
+export DB_PASSWORD=newsletter_password
 
+# AI settings
+export LLM_PROVIDER=mock  # or "groq", "ollama"
+export WORKFLOW_MODE=standard  # or "ai"
+
+# Demo mode
 export EMAIL_MODE=mock
-export LLM_PROVIDER=mock
-
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+export NEWS_SOURCE_MODE=stub
 ```
 
-Backend health check:
+### 3. Run
 
 ```bash
-curl http://127.0.0.1:8000/health
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-### 3. Start the Streamlit UI
+Visit http://localhost:8000/docs for interactive API docs.
 
-In a second terminal:
+## 📖 Demo
+
+### Quick Demo (Standard Workflow)
 
 ```bash
-cd ui
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-export BACKEND_URL="http://127.0.0.1:8000"
-
-streamlit run launcher.py
+./demo_quick.sh
 ```
 
-Open: `http://127.0.0.1:8501`
-
-## AI modes
-
-Set `LLM_PROVIDER` to one of:
-
-- `mock` for deterministic offline development.
-- `ollama` for local inference.
-- `groq` for cloud inference.
-
-See [docs/AI_PRIVACY.md](docs/AI_PRIVACY.md) for the data-sharing policy.
-
-## Documentation
-
-- [Architecture](docs/ARCHITECTURE.md)
-- [Roadmap](docs/ROADMAP.md)
-- [Development progress](docs/DEVELOPMENT_PROGRESS.md)
-- [AI privacy](docs/AI_PRIVACY.md)
-
-## Tests
-
-From the project root:
+### AI Workflow Demo
 
 ```bash
-pytest -q
+export WORKFLOW_MODE=ai
+./demo_ai.sh
 ```
+
+### Manual Demo
+
+```bash
+# 1. Create subscriber
+curl -X POST http://localhost:8000/api/subscribers \
+  -H "Content-Type: application/json" \
+  -d '{"email": "user@example.com", "name": "User", "topics": ["ai_news"]}'
+
+# 2. Create newsletter
+curl -X POST http://localhost:8000/api/newsletters \
+  -H "Content-Type: application/json" \
+  -d '{"title": "AI News", "topic": "ai_news", "body": "Content...", "source": "spiegel_wissenschaft_technik", "source_external_id": "001", "source_url": "https://example.com"}'
+
+# 3. Run workflow
+curl -X POST http://localhost:8000/api/workflows/newsletter/1/run
+```
+
+## 🏗️ Architecture
+
+┌─────────────────┐
+│ News Sources │ (RSS feeds, stub data)
+└────────┬────────┘
+│
+┌────────▼────────┐
+│ AI Relevance │ (Score articles 0.0-1.0)
+│ Scorer │
+└────────┬────────┘
+│
+┌────────▼────────┐
+│ Newsletter │ (Generate/Synthesize)
+│ Generator │
+└────────┬────────┘
+│
+┌────────▼────────┐
+│ Risk + Send │ (Classify + Decide)
+│ Decision │
+└────────┬────────┘
+│
+┌────┴────┐
+│ │
+┌───▼──┐ ┌──▼──────┐
+│ Send │ │ Review │
+└──────┘ └─────────┘
+
+## 📁 Project Structure
+
+newsletter-orchestrator/
+├── backend/
+│ ├── app/
+│ │ ├── ai_workflow_orchestrator.py # AI-enhanced workflow
+│ │ ├── ai_relevance_scorer.py # Article scoring
+│ │ ├── ai_newsletter_service.py # Classification, generation
+│ │ ├── schedule_service.py # Scheduler logic
+│ │ ├── routes_*.py # API endpoints
+│ │ └── models.py # Database models
+│ ├── scripts/
+│ │ ├── test_ai_workflow.py # AI workflow tests
+│ │ └── test_schedule_runs.py # Schedule tests
+│ └── demo_*.sh # Demo scripts
+├── GITHUB_DEMO.md # Detailed demo guide
+├── AI_WORKFLOW_ORCHESTRATION.md # AI workflow docs
+└── README.md # This file
+
+
+## 🔧 Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WORKFLOW_MODE` | `standard` | Workflow mode: `standard` or `ai` |
+| `LLM_PROVIDER` | `mock` | AI provider: `mock`, `groq`, `ollama` |
+| `RELEVANCE_THRESHOLD` | `0.6` | Minimum relevance score (0.0-1.0) |
+| `EMAIL_MODE` | `mock` | Email mode: `mock` or `smtp` |
+| `NEWS_SOURCE_MODE` | `stub` | News mode: `stub` or `rss` |
+
+## 🤖 AI Workflow Decision Matrix
+
+| Risk Level | Relevance | Articles | Decision |
+|------------|-----------|----------|----------|
+| Low | ≥0.8 | ≥2 | ✅ Auto-send |
+| Low | ≥0.6 | ≥1 | ✅ Auto-send |
+| Medium | ≥0.6 | ≥1 | ⚠️ Review |
+| High | Any | Any | ⚠️ Review |
+| Critical | Any | Any | ⚠️ Review |
+| Any | <0.6 | Any | ⏭️ Skip |
+
+## 📊 API Endpoints
+
+### Core
+- `POST /api/subscribers` - Create subscriber
+- `POST /api/newsletters` - Create newsletter
+- `POST /api/schedules` - Create schedule
+
+### Workflows
+- `POST /api/workflows/newsletter/{id}/run` - Run standard workflow
+- `POST /api/workflows/newsletter/{id}/run-ai` - Run AI workflow ✨
+
+### Automation
+- `POST /api/automation/enable` - Enable automation
+- `POST /api/automation/disable` - Disable automation
+
+## 🧪 Testing
+
+```bash
+# Run AI workflow tests
+cd backend
+python scripts/test_ai_workflow.py
+
+# Run schedule tests
+python scripts/test_schedule_runs.py
+
+# Run all tests
+pytest tests/
+```
+
+## 📚 Documentation
+
+- [GitHub Demo Guide](GITHUB_DEMO.md) - Complete walkthrough
+- [AI Workflow Orchestration](AI_WORKFLOW_ORCHESTRATION.md) - AI features
+- [Implementation Summary](IMPLEMENTATION_SUMMARY.md) - Technical details
+- [Quick Reference](QUICK_REFERENCE.md) - Cheat sheet
+
+## 🛠️ Development
+
+### Run with Real AI (Groq)
+
+```bash
+export WORKFLOW_MODE=ai
+export LLM_PROVIDER=groq
+export GROQ_API_KEY=your_api_key_here
+python -m uvicorn app.main:app --reload
+```
+
+### Run with Ollama (Local)
+
+```bash
+export WORKFLOW_MODE=ai
+export LLM_PROVIDER=ollama
+export OLLAMA_MODEL=llama3.1:8b
+python -m uvicorn app.main:app --reload
+```
+
+## 📈 Monitoring
+
+View schedule run history:
+
+```bash
+cd backend/scripts
+python test_schedule_runs.py
+```
+
+Check API health:
+
+```bash
+curl http://localhost:8000/health
+```
+
+## 🤝 Contributing
+
+1. Fork the repo
+2. Create a feature branch
+3. Make your changes
+4. Run tests
+5. Submit a PR
+
+## 📄 License
+
+MIT License - see [LICENSE](LICENSE) file for details.
+
+## 🙏 Acknowledgments
+
+- FastAPI for the web framework
+- LangGraph for workflow orchestration
+- Groq/Ollama for AI inference
+- SQLAlchemy for database ORM
+
+---
+
+**Built with ❤️ using FastAPI and LangGraph**
