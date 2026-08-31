@@ -25,6 +25,11 @@ class Settings(BaseModel):
 
     email_mode: str = Field(default="mock")
     news_source_mode: str = Field(default="stub")
+    rss_max_article_age_hours: int = Field(
+        default=168,
+        ge=1,
+        le=720,
+    )
 
     # AI workflow configuration
     workflow_mode: str = Field(default="standard")  # "standard" or "ai"
@@ -60,6 +65,9 @@ def load_settings() -> Settings:
             news_source_mode=os.getenv(
                 "NEWS_SOURCE_MODE",
                 "stub",
+            ),
+            rss_max_article_age_hours=int(
+                os.getenv("RSS_MAX_ARTICLE_AGE_HOURS", "168")
             ),
             workflow_mode=os.getenv("WORKFLOW_MODE", "standard"),
         )

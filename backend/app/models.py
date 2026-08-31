@@ -103,6 +103,41 @@ class Newsletter(Base):
     )
 
 
+class SourceDocument(Base):
+    __tablename__ = "source_documents"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    source = Column(String(120), nullable=False, index=True)
+    source_external_id = Column(String(255), nullable=False)
+    publisher = Column(String(255), nullable=True)
+
+    canonical_url = Column(String(1000), nullable=False)
+    published_at = Column(DateTime, nullable=False, index=True)
+    fetched_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
+    )
+
+    title = Column(String(1000), nullable=False)
+    normalized_text = Column(Text, nullable=False)
+    content_hash = Column(String(64), nullable=False, index=True)
+    source_metadata_json = Column(
+        Text,
+        nullable=False,
+        default="{}",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source",
+            "source_external_id",
+            name="uq_source_documents_identity",
+        ),
+    )
+
+
 class WorkflowExecution(Base):
     __tablename__ = "workflow_executions"
 

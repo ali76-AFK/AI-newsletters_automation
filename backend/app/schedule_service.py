@@ -7,6 +7,7 @@ from uuid import uuid4
 from sqlalchemy.orm import Session
 
 from .ai_newsletter_service import AIServiceError, classify_newsletter_text
+from .ai_relevance_scorer import RelevanceScorerError
 from .crud_newsletters import (
     create_newsletter,
     create_workflow_execution_for_newsletter,
@@ -158,7 +159,25 @@ def _run_schedule(
 
     try:
         topics, sources = _schedule_values(schedule)
-        article = _first_unseen_article(db, sources, topics)
+
+        try:
+            article = _first_unseen_article(db, sources, topics)
+        except RelevanceScorerError as exc:
+            run.status = "failed_ai_relevance"
+            run.message = (
+                "AI relevance verification was unavailable; "
+                f"no newsletter was created or sent. Details: {exc}"
+            )
+            run.completed_at = _utc_now()
+            schedule.last_run_at = now_utc
+            db.flush()
+
+            return {
+                "status": run.status,
+                "schedule_id": schedule.id,
+                "run": _serialize_run(run),
+                "newsletter": None,
+            }
 
         if article is None:
             run.status = "skipped_no_relevant_articles"

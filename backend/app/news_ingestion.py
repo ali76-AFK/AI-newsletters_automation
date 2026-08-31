@@ -4,6 +4,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from html import unescape
 from typing import Iterable
 from urllib.parse import urlparse
@@ -344,6 +345,38 @@ def _validated_rss_url(source: str, topic: str) -> str:
     return feed_url
 
 
+def _article_url_is_allowlisted(
+    source: str,
+    article_url: str,
+) -> bool:
+    allowed_hosts = {
+        "spiegel_wissenschaft_technik": {
+            "spiegel.de",
+            "www.spiegel.de",
+        },
+        "spiegel_wirtschaft": {
+            "spiegel.de",
+            "www.spiegel.de",
+        },
+        "spiegel_ausland": {
+            "spiegel.de",
+            "www.spiegel.de",
+        },
+        "spiegel_politik": {
+            "spiegel.de",
+            "www.spiegel.de",
+        },
+    }
+
+    parsed = urlparse(article_url)
+
+    return (
+        parsed.scheme == "https"
+        and (parsed.hostname or "").lower()
+        in allowed_hosts.get(source, set())
+    )
+
+
 def _entry_timestamp(entry: object) -> str:
     published = getattr(entry, "published", None)
     updated = getattr(entry, "updated", None)
@@ -379,7 +412,23 @@ def is_relevant_for_topic(
     if topic == "technology_science":
         return True
 
-    # Use AI scoring if settings provided
+    # In mock mode, use deterministic multilingual keyword matching.
+    # This keeps local tests and live RSS development predictable without
+    # lowering the relevance threshold for unrelated articles.
+    if settings is not None and settings.llm_provider.strip().lower() == "mock":
+        keywords = TOPIC_KEYWORDS.get(topic)
+
+        if keywords is None:
+            return False
+
+        haystack = f"{article.title} {article.body}"
+
+        return any(
+            _keyword_matches(haystack, keyword)
+            for keyword in keywords
+        )
+
+    # Use the configured AI scorer for non-mock providers.
     if settings is not None:
         from .ai_relevance_scorer import score_article_relevance
 
@@ -390,11 +439,10 @@ def is_relevant_for_topic(
             settings=settings,
         )
 
-        # Default threshold: 0.7
         threshold = getattr(settings, "relevance_threshold", 0.7)
         return result["score"] >= threshold
 
-    # Fallback to keyword matching for backward compatibility
+    # Fallback to keyword matching when settings are not provided.
     keywords = TOPIC_KEYWORDS.get(topic)
 
     if keywords is None:
@@ -406,6 +454,93 @@ def is_relevant_for_topic(
         _keyword_matches(haystack, keyword)
         for keyword in keywords
     )
+
+
+def _parse_published_at_utc(
+    published_at: str,
+) -> datetime | None:
+    value = published_at.strip()
+
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+    except ValueError:
+        try:
+            parsed = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+
+    if parsed.tzinfo is None:
+        return None
+
+    return parsed.astimezone(timezone.utc)
+
+
+def filter_fresh_articles(
+    articles: list[NewsArticle],
+    max_age_hours: int,
+    now_utc: datetime | None = None,
+) -> list[NewsArticle]:
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
+    if now_utc.tzinfo is None:
+        raise ValueError("now_utc must be timezone-aware.")
+
+    now_utc = now_utc.astimezone(timezone.utc)
+    max_age_seconds = max_age_hours * 60 * 60
+    fresh_articles: list[NewsArticle] = []
+
+    for article in articles:
+        published_at = _parse_published_at_utc(article.published_at)
+
+        if published_at is None:
+            continue
+
+        age_seconds = (now_utc - published_at).total_seconds()
+
+        if age_seconds < 0:
+            continue
+
+        if age_seconds > max_age_seconds:
+            continue
+
+        fresh_articles.append(article)
+
+    return fresh_articles
+
+
+def _source_publisher(source: str) -> str:
+    publishers = {
+        "spiegel_wissenschaft_technik": "DER SPIEGEL",
+        "spiegel_wirtschaft": "DER SPIEGEL",
+        "spiegel_ausland": "DER SPIEGEL",
+        "spiegel_politik": "DER SPIEGEL",
+    }
+
+    return publishers.get(source, source)
+
+
+def persist_source_documents(
+    articles: list[NewsArticle],
+) -> None:
+    if not articles:
+        return
+
+    from .crud_source_documents import upsert_source_document
+    from .db import get_session
+
+    with get_session() as db:
+        for article in articles:
+            upsert_source_document(
+                db=db,
+                article=article,
+                publisher=_source_publisher(article.source),
+            )
 
 
 def filter_relevant_articles(
@@ -466,6 +601,9 @@ def fetch_rss_articles(
         if parsed_url.scheme != "https" or not parsed_url.netloc:
             continue
 
+        if not _article_url_is_allowlisted(source, url):
+            continue
+
         title = _safe_text(getattr(entry, "title", None))
         summary = _safe_text(
             getattr(entry, "summary", None)
@@ -493,7 +631,18 @@ def fetch_rss_articles(
             )
         )
 
-    return filter_relevant_articles(articles, topic, settings)
+    relevant_articles = filter_relevant_articles(
+        articles,
+        topic,
+        settings,
+    )
+    fresh_articles = filter_fresh_articles(
+        relevant_articles,
+        settings.rss_max_article_age_hours,
+    )
+    persist_source_documents(fresh_articles)
+
+    return fresh_articles
 
 
 def get_articles(
