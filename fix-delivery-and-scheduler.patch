@@ -1,0 +1,2431 @@
+From 70a9f7207c76c785f21b811e8c1398b2cb1ab2bf Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 10 Nov 2026 23:11:05 +0000
+Subject: [PATCH] Real SMTP delivery, AI workflow fix, persisted failed runs,
+ catch-up window
+
+Email
+- EMAIL_MODE=smtp: real delivery via SMTP_* (STARTTLS / SSL / none, optional
+  login, certificate verification, no silent downgrade). "real" is an alias.
+- One message per subscriber (was one shared message exposing every address).
+- Drafts are marked sent/failed; re-running a newsletter never re-sends, and a
+  partially failed run can be retried safely.
+- mock mode is Mailpit only and ignores SMTP_* so it can never reach a provider.
+
+AI workflow
+- Set state.topic (was never assigned: every AI send failed "Topic not set").
+- Score/generate from the scheduled article instead of re-fetching the topic.
+- Low relevance routes to "skip" before any LLM generation.
+- skipped / pending_review statuses are no longer overwritten with "sent".
+- RELEVANCE_THRESHOLD env var is now honoured.
+
+Scheduler
+- Failed runs are persisted (savepoint per run) with the reason; one failing or
+  malformed schedule no longer aborts or erases the rest of the scan.
+- Each schedule is committed immediately and its window is claimed before
+  sending, so a later error or a crash cannot cause a duplicate send.
+- Catch-up window (SCHEDULE_CATCHUP_MINUTES, default 15) replaces exact-minute
+  matching; window key is based on the scheduled moment.
+- Run status reflects what actually happened (partial_failure,
+  skipped_low_relevance, pending_review) instead of always "sent".
+- Worker log now shows counts and failure reasons.
+
+Tests: 26 new tests (SMTP via fake smtplib, workflow idempotency, scan
+resilience, catch-up incl. midnight and DST gap, AI fixes); legacy exact-minute
+assertions updated; RSS fixture dates made relative; conftest creates schema.
+---
+ .env.example                                  |  29 +-
+ README.md                                     |  56 +-
+ backend/app/ai_workflow_orchestrator.py       | 118 ++--
+ backend/app/config.py                         |  47 +-
+ backend/app/delivery.py                       |  71 ++
+ backend/app/email_sender.py                   | 234 +++++--
+ backend/app/langgraph_state.py                |   6 +-
+ backend/app/langgraph_workflow.py             |  38 +-
+ backend/app/routes_workflows.py               |   4 +
+ backend/app/schedule_service.py               | 432 +++++++-----
+ backend/app/scheduler_logic.py                | 102 ++-
+ backend/app/scheduler_worker.py               |  24 +-
+ tests/backend/test_delivery_and_resilience.py | 621 ++++++++++++++++++
+ tests/backend/test_news_ingestion.py          |  20 +-
+ tests/backend/test_schedule_execution.py      |   4 +-
+ tests/backend/test_scheduler_logic.py         |  79 ++-
+ tests/conftest.py                             |  14 +
+ 17 files changed, 1609 insertions(+), 290 deletions(-)
+ create mode 100644 backend/app/delivery.py
+ create mode 100644 tests/backend/test_delivery_and_resilience.py
+
+diff --git a/.env.example b/.env.example
+index 07a57f1..77117e0 100644
+--- a/.env.example
++++ b/.env.example
+@@ -22,8 +22,35 @@ GROQ_API_KEY=your_groq_api_key_here
+ 
+ # IMPORTANT: set this to a supported Groq model from Groq docs.
+ GROQ_MODEL=openai/gpt-oss-20b
+-EMAIL_MODE=mock
+ 
+ # News ingestion mode: stub | rss
+ # Keep stub for deterministic development and tests.
+ NEWS_SOURCE_MODE=stub
++
++# --- Email delivery -----------------------------------------------------------
++# mock : send to a local Mailpit (SMTP 127.0.0.1:1025, UI http://127.0.0.1:8025).
++#        Nothing leaves your machine. SMTP_* below are ignored in this mode.
++# smtp : real delivery through the SMTP server configured below.
++EMAIL_MODE=mock
++
++# Sender shown to recipients. REQUIRED (and must be a verified sender at your
++# provider) when EMAIL_MODE=smtp; the default placeholder is refused for real sends.
++EMAIL_FROM=newsletter-orchestrator@example.com
++
++# Only used when EMAIL_MODE=smtp
++SMTP_HOST=
++# Leave empty to use the default for SMTP_SECURITY (587 / 465 / 25)
++SMTP_PORT=
++SMTP_USERNAME=
++SMTP_PASSWORD=
++# starttls (port 587, default) | ssl (port 465) | none (plain; only for trusted local relays)
++SMTP_SECURITY=starttls
++SMTP_TIMEOUT_SECONDS=30
++
++# --- Scheduler ----------------------------------------------------------------
++# A delivery is still picked up for this many minutes after its scheduled minute
++# (worker restarts, slow scans, short outages). 0 = exact minute only.
++SCHEDULE_CATCHUP_MINUTES=15
++
++# Minimum AI relevance score (0.0-1.0) for an article to be sent
++RELEVANCE_THRESHOLD=0.6
+diff --git a/README.md b/README.md
+index bb0ff23..d2ef3ea 100644
+--- a/README.md
++++ b/README.md
+@@ -20,8 +20,8 @@ AI-powered newsletter automation with intelligent content curation and automated
+ ### 1. Clone & Install
+ 
+ ```bash
+-git clone https://github.com/yourusername/newsletter-orchestrator.git
+-cd newsletter-orchestrator/backend
++git clone https://github.com/ali76-AFK/AI-newsletters_automation.git
++cd AI-newsletters_automation/backend
+ python -m venv .venv
+ source .venv/bin/activate
+ pip install -e .
+@@ -42,7 +42,7 @@ export LLM_PROVIDER=mock  # or "groq", "ollama"
+ export WORKFLOW_MODE=standard  # or "ai"
+ 
+ # Demo mode
+-export EMAIL_MODE=mock
++export EMAIL_MODE=mock          # mock = local Mailpit; smtp = real delivery (see Email delivery)
+ export NEWS_SOURCE_MODE=stub
+ ```
+ 
+@@ -140,7 +140,12 @@ newsletter-orchestrator/
+ | `WORKFLOW_MODE` | `standard` | Workflow mode: `standard` or `ai` |
+ | `LLM_PROVIDER` | `mock` | AI provider: `mock`, `groq`, `ollama` |
+ | `RELEVANCE_THRESHOLD` | `0.6` | Minimum relevance score (0.0-1.0) |
+-| `EMAIL_MODE` | `mock` | Email mode: `mock` or `smtp` |
++| `EMAIL_MODE` | `mock` | `mock` (local Mailpit) or `smtp` (real delivery; `real` is accepted as an alias) |
++| `EMAIL_FROM` | `newsletter-orchestrator@example.com` | Sender address. **Required** and provider-verified for `smtp` |
++| `SMTP_HOST` / `SMTP_PORT` | – | SMTP server (port defaults to 587 / 465 / 25 by `SMTP_SECURITY`) |
++| `SMTP_USERNAME` / `SMTP_PASSWORD` | – | Login (set both or neither) |
++| `SMTP_SECURITY` | `starttls` | `starttls`, `ssl` or `none` |
++| `SCHEDULE_CATCHUP_MINUTES` | `15` | How long after its minute a delivery can still be picked up (`0` = exact minute) |
+ | `NEWS_SOURCE_MODE` | `stub` | News mode: `stub` or `rss` |
+ 
+ ## 🤖 AI Workflow Decision Matrix
+@@ -166,8 +171,47 @@ newsletter-orchestrator/
+ - `POST /api/workflows/newsletter/{id}/run-ai` - Run AI workflow ✨
+ 
+ ### Automation
+-- `POST /api/automation/enable` - Enable automation
+-- `POST /api/automation/disable` - Disable automation
++- `GET /api/automation/status` - Automation status
++- `POST /api/automation/start` - Start automation
++- `POST /api/automation/stop` - Stop automation
++- `POST /api/automation/tick` - Run one automation tick
++
++### Schedules
++- `POST /api/schedules/{id}/run-now` - Run a schedule immediately
++- `POST /api/schedules/scan-due` - Run one scheduler scan
++- `GET /api/schedules/{id}/runs` - Run history (including `failed` runs and why)
++
++## 📬 Email delivery
++
++Every subscriber receives **their own message** (their address is the only one in `To:`), personalised from their draft. Drafts are marked `sent`/`failed`, so re-running a newsletter never re-emails people who already got it, and a partly failed run can be retried safely.
++
++**Local testing (default).** `EMAIL_MODE=mock` sends to Mailpit (`docker compose` in `infrastructure/` starts it). Open http://127.0.0.1:8025 to see the mail.
++
++**Real delivery.**
++
++```bash
++export EMAIL_MODE=smtp
++export EMAIL_FROM=news@your-verified-domain.org
++export SMTP_HOST=smtp.your-provider.example
++export SMTP_USERNAME=...        # keep secrets out of git
++export SMTP_PASSWORD=...
++# SMTP_SECURITY=starttls (default, port 587) | ssl (port 465)
++```
++
++Certificates are always verified and a server that does not offer STARTTLS is refused rather than silently downgraded. Use your provider's SMTP credentials, and send a test to yourself before using real subscribers.
++
++## ⏱️ Running the automation
++
++Automatic delivery needs **two processes** besides the database/Mailpit; the API alone does not send scheduled newsletters:
++
++```bash
++python -m uvicorn app.main:app --port 8000      # API
++python -m app.scheduler_worker                   # scheduler (scans every 60 s)
++```
++
++A schedule fires from its delivery time until `SCHEDULE_CATCHUP_MINUTES` later, so a restart or short outage does not lose it, and each delivery runs at most once. If a run fails (for example the mail server is down) it is recorded with status `failed` and the reason in `GET /api/schedules/{id}/runs`; it is **not** retried automatically. Other run statuses include `sent`, `partial_failure`, `pending_review` and `skipped_low_relevance`.
++
++Settings are read from the process environment; `.env.example` is a template and is not loaded automatically.
+ 
+ ## 🧪 Testing
+ 
+diff --git a/backend/app/ai_workflow_orchestrator.py b/backend/app/ai_workflow_orchestrator.py
+index 8624f0f..9140cc0 100644
+--- a/backend/app/ai_workflow_orchestrator.py
++++ b/backend/app/ai_workflow_orchestrator.py
+@@ -30,7 +30,8 @@ from .models import (
+     ScheduleRun,
+ )
+ from .news_ingestion import NewsArticle, get_articles
+-from .email_sender import send_email, EmailSendError
++from .delivery import deliver_newsletter_drafts
++from .email_sender import EmailSendError, get_sender_address
+ 
+ 
+ class WorkflowOrchestratorError(Exception):
+@@ -44,7 +45,7 @@ class ScoredArticle:
+     reason: str
+ 
+ 
+-RELEVANCE_THRESHOLD = 0.6  # Minimum score to include article
++RELEVANCE_THRESHOLD = load_settings().relevance_threshold  # env: RELEVANCE_THRESHOLD
+ HIGH_RELEVANCE_THRESHOLD = 0.8  # Score above this is "highly relevant"
+ 
+ 
+@@ -89,6 +90,33 @@ def _select_top_articles(
+     return relevant[:max_articles]
+ 
+ 
++def _resolve_scheduled_article(newsletter: Newsletter, topic: str) -> NewsArticle:
++    """
++    Return the article this newsletter was created from.
++
++    Prefers the live copy (matched by source + external id); if the feed no longer
++    lists it, or the newsletter was created manually, falls back to the newsletter
++    record itself. Never substitutes a different article.
++    """
++    if newsletter.source and newsletter.source_external_id:
++        try:
++            for article in get_articles(source=newsletter.source, topic=topic):
++                if article.external_id == newsletter.source_external_id:
++                    return article
++        except Exception:  # noqa: BLE001 - feed trouble must not lose the scheduled article
++            pass
++
++    return NewsArticle(
++        source=newsletter.source or "manual",
++        external_id=newsletter.source_external_id or f"newsletter-{newsletter.id}",
++        url=newsletter.source_url or "",
++        published_at="",
++        topic=topic,
++        title=newsletter.title,
++        body=newsletter.body,
++    )
++
++
+ def _generate_newsletter_content(
+     articles: list[ScoredArticle],
+     topic: str,
+@@ -189,34 +217,29 @@ def build_ai_workflow_graph(db: Session) -> StateGraph[WorkflowState]:
+     graph = StateGraph(WorkflowState)
+ 
+     def score_and_select_node(state: WorkflowState) -> WorkflowState:
+-        """Score articles and select top ones."""
++        """Score the scheduled article; low relevance short-circuits to 'skip'."""
+         newsletter = db.get(Newsletter, state.newsletter_id)
+         if newsletter is None:
+             raise WorkflowOrchestratorError(f"Newsletter {state.newsletter_id} not found")
+ 
+-        # Fetch fresh articles for this topic
+-        try:
+-            articles = get_articles(
+-                source=newsletter.source,
+-                topic=state.topic or newsletter.topic,
+-            )
+-        except Exception as exc:
+-            raise WorkflowOrchestratorError(f"Failed to fetch articles: {exc}") from exc
+-
+-        # Score articles
+-        scored = _score_articles(articles, state.topic or newsletter.topic)
+-
+-        # Select top articles
+-        selected = _select_top_articles(scored, max_articles=3)
++        # Every later node reads state.topic; nothing else sets it.
++        state.topic = newsletter.topic
+ 
+-        if not selected:
++        article = _resolve_scheduled_article(newsletter, state.topic)
++        scored = _score_articles([article], state.topic)
++        if not scored:
+             raise WorkflowOrchestratorError(
+-                f"No articles above relevance threshold ({RELEVANCE_THRESHOLD})"
++                f"Relevance scoring failed for article {article.external_id!r}"
+             )
+ 
+-        # Store in state for next node
+-        state.ai_selected_articles = selected
+-        state.ai_avg_relevance = sum(s.score for s in selected) / len(selected)
++        state.ai_selected_articles = scored
++        state.ai_avg_relevance = scored[0].score
++
++        if scored[0].score < RELEVANCE_THRESHOLD:
++            state.ai_send_decision = "skip"
++            newsletter.status = "skipped"
++            newsletter.approved = False
++            db.flush()
+ 
+         return state
+ 
+@@ -351,8 +374,9 @@ def build_ai_workflow_graph(db: Session) -> StateGraph[WorkflowState]:
+             )
+ 
+             if existing:
+-                existing.subject = subject
+-                existing.body = body
++                if existing.status != "sent":
++                    existing.subject = subject
++                    existing.body = body
+                 draft = existing
+             else:
+                 draft = DraftEmail(
+@@ -385,29 +409,39 @@ def build_ai_workflow_graph(db: Session) -> StateGraph[WorkflowState]:
+         if not newsletter.approved:
+             raise WorkflowOrchestratorError("Newsletter not approved; cannot send")
+ 
+-        sender = "newsletter-orchestrator@example.com"
+-        recipients = [s.email for s in state.subscribers]
+-        subject = newsletter.title
+-        body = newsletter.body
+-
+         try:
+-            send_email(sender, recipients, subject, body)
++            sender = get_sender_address()
++            outcome = deliver_newsletter_drafts(
++                db, newsletter.id, state.subscribers, sender
++            )
+         except EmailSendError as exc:
+             raise WorkflowOrchestratorError(f"Email sending failed: {exc}") from exc
+ 
++        if outcome.failed and not outcome.sent and not outcome.already_sent:
++            first_to, first_err = next(iter(outcome.failed.items()))
++            raise WorkflowOrchestratorError(
++                f"Email sending failed for all {len(outcome.failed)} recipients "
++                f"(first: {first_to}: {first_err})"
++            )
++
+         state.send_summary = SendSummary(
+             sender=sender,
+-            recipients=recipients,
+-            subject=subject,
+-            count=len(recipients),
++            recipients=outcome.sent,
++            subject=newsletter.title,
++            count=len(outcome.sent),
++            failed=outcome.failed,
++            already_sent=outcome.already_sent,
+         )
+         return state
+ 
+     def update_state_node(state: WorkflowState) -> WorkflowState:
+         """Update workflow and newsletter state."""
+-        wf = db.query(WorkflowExecution).filter(
+-            WorkflowExecution.newsletter_id == state.newsletter_id
+-        ).first()
++        wf = (
++            db.query(WorkflowExecution)
++            .filter(WorkflowExecution.newsletter_id == state.newsletter_id)
++            .order_by(WorkflowExecution.started_at.desc())
++            .first()
++        )
+ 
+         newsletter = db.get(Newsletter, state.newsletter_id)
+ 
+@@ -416,7 +450,11 @@ def build_ai_workflow_graph(db: Session) -> StateGraph[WorkflowState]:
+ 
+         wf.state = "completed"
+         wf.completed_at = datetime.utcnow()
+-        newsletter.status = "sent"
++        # Only a 'send' decision means mail went out. 'skip' / 'review' keep the
++        # status the decision step already set (skipped / pending_review).
++        if state.ai_send_decision == "send":
++            has_failures = bool(state.send_summary and state.send_summary.failed)
++            newsletter.status = "partially_sent" if has_failures else "sent"
+         db.flush()
+ 
+         return state
+@@ -432,7 +470,11 @@ def build_ai_workflow_graph(db: Session) -> StateGraph[WorkflowState]:
+ 
+     # Define edges
+     graph.set_entry_point("score_and_select")
+-    graph.add_edge("score_and_select", "generate_newsletter")
++
++    def route_after_scoring(state: WorkflowState) -> str:
++        return "update_state" if state.ai_send_decision == "skip" else "generate_newsletter"
++
++    graph.add_conditional_edges("score_and_select", route_after_scoring)
+     graph.add_edge("generate_newsletter", "classify_and_decide")
+ 
+     # Conditional routing based on decision
+diff --git a/backend/app/config.py b/backend/app/config.py
+index 927a3b0..78cdb29 100644
+--- a/backend/app/config.py
++++ b/backend/app/config.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import os
++from typing import Literal
+ 
+ from pydantic import BaseModel, Field, ValidationError
+ 
+@@ -23,7 +24,18 @@ class Settings(BaseModel):
+         default="replace_with_supported_groq_model"
+     )
+ 
++    # EMAIL_MODE: "mock" (local Mailpit, never leaves the machine) or
++    # "smtp" (real delivery). "real" is accepted as an alias for "smtp".
+     email_mode: str = Field(default="mock")
++    email_from: str = Field(default="newsletter-orchestrator@example.com")
++    mock_smtp_host: str = Field(default="127.0.0.1")
++    mock_smtp_port: int = Field(default=1025, ge=1, le=65535)
++    smtp_host: str | None = Field(default=None)
++    smtp_port: int | None = Field(default=None, ge=1, le=65535)
++    smtp_username: str | None = Field(default=None)
++    smtp_password: str | None = Field(default=None, repr=False)
++    smtp_security: Literal["starttls", "ssl", "none"] = Field(default="starttls")
++    smtp_timeout_seconds: int = Field(default=30, ge=1, le=300)
+     news_source_mode: str = Field(default="stub")
+     rss_max_article_age_hours: int = Field(
+         default=168,
+@@ -35,6 +47,10 @@ class Settings(BaseModel):
+     workflow_mode: str = Field(default="standard")  # "standard" or "ai"
+     relevance_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+ 
++    # How long after its scheduled minute a schedule may still be picked up
++    # (covers worker restarts, slow scans, and short outages). 0 = exact minute.
++    schedule_catchup_minutes: int = Field(default=15, ge=0, le=1440)
++
+     @property
+     def sqlalchemy_dsn(self) -> str:
+         return (
+@@ -43,6 +59,18 @@ class Settings(BaseModel):
+         )
+ 
+ 
++def _opt_str(name: str) -> str | None:
++    value = os.getenv(name)
++    if value is None or value.strip() == "":
++        return None
++    return value.strip()
++
++
++def _opt_int(name: str) -> int | None:
++    value = _opt_str(name)
++    return int(value) if value is not None else None
++
++
+ def load_settings() -> Settings:
+     try:
+         return Settings(
+@@ -61,7 +89,18 @@ def load_settings() -> Settings:
+                 "GROQ_MODEL",
+                 "replace_with_supported_groq_model",
+             ),
+-            email_mode=os.getenv("EMAIL_MODE", "mock"),
++            email_mode=os.getenv("EMAIL_MODE", "mock").strip().lower(),
++            email_from=os.getenv(
++                "EMAIL_FROM", "newsletter-orchestrator@example.com"
++            ).strip(),
++            mock_smtp_host=os.getenv("MOCK_SMTP_HOST", "127.0.0.1"),
++            mock_smtp_port=int(os.getenv("MOCK_SMTP_PORT", "1025")),
++            smtp_host=_opt_str("SMTP_HOST"),
++            smtp_port=_opt_int("SMTP_PORT"),
++            smtp_username=_opt_str("SMTP_USERNAME"),
++            smtp_password=os.getenv("SMTP_PASSWORD") or None,
++            smtp_security=os.getenv("SMTP_SECURITY", "starttls").strip().lower(),
++            smtp_timeout_seconds=int(os.getenv("SMTP_TIMEOUT_SECONDS", "30")),
+             news_source_mode=os.getenv(
+                 "NEWS_SOURCE_MODE",
+                 "stub",
+@@ -70,8 +109,12 @@ def load_settings() -> Settings:
+                 os.getenv("RSS_MAX_ARTICLE_AGE_HOURS", "168")
+             ),
+             workflow_mode=os.getenv("WORKFLOW_MODE", "standard"),
++            relevance_threshold=float(os.getenv("RELEVANCE_THRESHOLD", "0.6")),
++            schedule_catchup_minutes=int(
++                os.getenv("SCHEDULE_CATCHUP_MINUTES", "15")
++            ),
+         )
+-    except ValidationError as exc:
++    except (ValidationError, ValueError) as exc:
+         raise RuntimeError(
+             f"Invalid configuration: {exc}"
+         ) from exc
+diff --git a/backend/app/delivery.py b/backend/app/delivery.py
+new file mode 100644
+index 0000000..432a8f5
+--- /dev/null
++++ b/backend/app/delivery.py
+@@ -0,0 +1,71 @@
++"""
++Send a newsletter's per-subscriber drafts, one message per subscriber.
++
++Shared by the standard and AI workflow graphs. A draft that is already
++``sent`` is never sent again, so re-running a workflow is safe, and a run that
++failed for only some recipients can be retried without re-emailing the others.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Dict, List, Sequence
++
++from sqlalchemy.orm import Session
++
++from .email_sender import OutgoingEmail, send_individual_emails
++from .langgraph_state import SubscriberState
++from .models import DraftEmail
++
++
++@dataclass
++class DeliveryOutcome:
++    sent: List[str] = field(default_factory=list)
++    failed: Dict[str, str] = field(default_factory=dict)
++    already_sent: List[str] = field(default_factory=list)
++
++
++def deliver_newsletter_drafts(
++    db: Session,
++    newsletter_id: int,
++    subscribers: Sequence[SubscriberState],
++    sender: str,
++) -> DeliveryOutcome:
++    """
++    Raises EmailSendError only when delivery could not be attempted at all
++    (nothing was sent, draft statuses are untouched).
++    """
++    outcome = DeliveryOutcome()
++    drafts_by_subscriber = {
++        d.subscriber_id: d
++        for d in db.query(DraftEmail)
++        .filter(
++            DraftEmail.newsletter_id == newsletter_id,
++            DraftEmail.subscriber_id.in_([s.id for s in subscribers]),
++        )
++        .all()
++    }
++
++    pending: List[tuple[DraftEmail, str]] = []
++    for sub in subscribers:
++        draft = drafts_by_subscriber.get(sub.id)
++        if draft is None:
++            outcome.failed[sub.email] = "no draft exists for this subscriber"
++            continue
++        if draft.status == "sent":
++            outcome.already_sent.append(sub.email)
++            continue
++        pending.append((draft, sub.email))
++
++    items = [OutgoingEmail(to=email, subject=d.subject, body=d.body) for d, email in pending]
++    errors = send_individual_emails(sender, items)  # may raise EmailSendError
++
++    for (draft, email), error in zip(pending, errors):
++        if error is None:
++            draft.status = "sent"
++            outcome.sent.append(email)
++        else:
++            draft.status = "failed"
++            outcome.failed[email] = error
++
++    db.flush()
++    return outcome
+diff --git a/backend/app/email_sender.py b/backend/app/email_sender.py
+index 50ce6fe..9f50dcb 100644
+--- a/backend/app/email_sender.py
++++ b/backend/app/email_sender.py
+@@ -1,56 +1,202 @@
++"""
++Email delivery.
++
++EMAIL_MODE
++  mock  -> local SMTP sink (Mailpit) at MOCK_SMTP_HOST:MOCK_SMTP_PORT. Nothing
++           leaves the machine. SMTP_* settings are deliberately ignored here so
++           flipping back to "mock" can never reach a real provider.
++  smtp  -> real delivery through the SMTP server in SMTP_* ("real" is accepted
++           as an alias).
++
++Every recipient gets their own message (their address is the only one in
++``To:``), sent over a single connection per batch.
++"""
+ from __future__ import annotations
+ 
+ import smtplib
++import ssl
++from dataclasses import dataclass
+ from email.message import EmailMessage
+-from typing import List
+-
+-from .config import load_settings
++from email.utils import formatdate, make_msgid
++from typing import List, Optional, Sequence
+ 
+-_settings = load_settings()
++from .config import Settings, load_settings
+ 
+ 
+ class EmailSendError(Exception):
+-    pass
++    """Delivery could not be attempted (bad config, cannot connect/log in)."""
+ 
+ 
+-def send_email_mock(
+-    sender: str,
+-    recipients: List[str],
+-    subject: str,
+-    body: str,
+-) -> None:
+-    """
+-    Mock sending via local SMTP (Mailpit).
+-    Uses localhost:1025, no auth.
+-    """
+-    msg = EmailMessage()
+-    msg["From"] = sender
+-    msg["To"] = ", ".join(recipients)
+-    msg["Subject"] = subject
+-    msg.set_content(body)
++@dataclass(frozen=True)
++class OutgoingEmail:
++    to: str
++    subject: str
++    body: str
++
++
++@dataclass(frozen=True)
++class _SmtpTarget:
++    host: str
++    port: int
++    security: str  # "starttls" | "ssl" | "none"
++    username: Optional[str]
++    password: Optional[str]
++    timeout: int
++    label: str
++
++
++_DEFAULT_PORTS = {"ssl": 465, "starttls": 587, "none": 25}
++
++
++def _mode(settings: Settings) -> str:
++    mode = settings.email_mode.strip().lower()
++    return "smtp" if mode == "real" else mode
++
++
++def get_sender_address(settings: Optional[Settings] = None) -> str:
++    """Address used in ``From:``. Real delivery requires it to be set explicitly."""
++    settings = settings or load_settings()
++    if _mode(settings) == "smtp" and settings.email_from.endswith("@example.com"):
++        raise EmailSendError(
++            "EMAIL_FROM must be set to a real, provider-verified sender address "
++            "when EMAIL_MODE=smtp."
++        )
++    return settings.email_from
++
++
++def _resolve_target(settings: Settings) -> _SmtpTarget:
++    mode = _mode(settings)
++
++    if mode == "mock":
++        return _SmtpTarget(
++            host=settings.mock_smtp_host,
++            port=settings.mock_smtp_port,
++            security="none",
++            username=None,
++            password=None,
++            timeout=settings.smtp_timeout_seconds,
++            label=f"mock SMTP {settings.mock_smtp_host}:{settings.mock_smtp_port}",
++        )
++
++    if mode == "smtp":
++        if not settings.smtp_host:
++            raise EmailSendError("EMAIL_MODE=smtp requires SMTP_HOST to be set.")
++        if bool(settings.smtp_username) != bool(settings.smtp_password):
++            raise EmailSendError(
++                "SMTP_USERNAME and SMTP_PASSWORD must be set together (or both unset)."
++            )
++        port = settings.smtp_port or _DEFAULT_PORTS[settings.smtp_security]
++        return _SmtpTarget(
++            host=settings.smtp_host,
++            port=port,
++            security=settings.smtp_security,
++            username=settings.smtp_username,
++            password=settings.smtp_password,
++            timeout=settings.smtp_timeout_seconds,
++            label=f"SMTP {settings.smtp_host}:{port} ({settings.smtp_security})",
++        )
++
++    raise EmailSendError(
++        f"Unsupported EMAIL_MODE: {settings.email_mode!r} (use 'mock' or 'smtp')."
++    )
++
+ 
++def _connect(target: _SmtpTarget) -> smtplib.SMTP:
++    """Open and authenticate one SMTP connection. Raises EmailSendError."""
+     try:
+-        with smtplib.SMTP("127.0.0.1", 1025, timeout=10) as smtp:
+-            smtp.send_message(msg)
+-    except Exception as exc:  # noqa: BLE001
+-        raise EmailSendError(f"Mock email send failed: {exc}") from exc
++        if target.security == "ssl":
++            client: smtplib.SMTP = smtplib.SMTP_SSL(
++                target.host,
++                target.port,
++                timeout=target.timeout,
++                context=ssl.create_default_context(),
++            )
++        else:
++            client = smtplib.SMTP(target.host, target.port, timeout=target.timeout)
++            if target.security == "starttls":
++                client.ehlo()
++                client.starttls(context=ssl.create_default_context())
++                client.ehlo()
++        if target.username and target.password:
++            client.login(target.username, target.password)
++        return client
++    except smtplib.SMTPAuthenticationError as exc:
++        raise EmailSendError(
++            f"SMTP login rejected by {target.label}: check SMTP_USERNAME/SMTP_PASSWORD "
++            f"({exc.smtp_code})"
++        ) from exc
++    except Exception as exc:  # noqa: BLE001 - surface any connect-level failure uniformly
++        raise EmailSendError(f"Could not connect to {target.label}: {exc}") from exc
+ 
+ 
+-def send_email_real(
++def _build_message(sender: str, item: OutgoingEmail) -> EmailMessage:
++    msg = EmailMessage()
++    msg["From"] = sender
++    msg["To"] = item.to  # exactly one recipient per message
++    msg["Subject"] = item.subject
++    msg["Date"] = formatdate(localtime=False)
++    msg["Message-ID"] = make_msgid(domain=sender.rsplit("@", 1)[-1] or None)
++    msg.set_content(item.body)
++    return msg
++
++
++def send_individual_emails(
+     sender: str,
+-    recipients: List[str],
+-    subject: str,
+-    body: str,
+-) -> None:
++    items: Sequence[OutgoingEmail],
++    settings: Optional[Settings] = None,
++) -> List[Optional[str]]:
+     """
+-    Stub for real sending (e.g., Brevo).
++    Send each item as its own message.
+ 
+-    TODO: Implement Brevo SMTP/API integration here.
+-    For now, we raise a clear error to avoid accidental real sends.
++    Returns a list aligned with ``items``: ``None`` for success, otherwise an error
++    string for that recipient. A rejected/invalid recipient does not stop the rest.
++    Raises EmailSendError only if delivery cannot be attempted at all (bad config,
++    cannot connect, login rejected).
+     """
+-    raise EmailSendError(
+-        "Real email sending is not yet implemented. Configure Brevo/SMTP here when ready."
+-    )
++    if not items:
++        return []
++
++    settings = settings or load_settings()
++    target = _resolve_target(settings)
++    client = _connect(target)
++
++    errors: List[Optional[str]] = []
++    try:
++        for item in items:
++            try:
++                msg = _build_message(sender, item)
++            except ValueError as exc:  # e.g. newline in a header (injection attempt)
++                errors.append(f"invalid message: {exc}")
++                continue
++
++            try:
++                client.send_message(msg)
++                errors.append(None)
++            except smtplib.SMTPServerDisconnected:
++                # Providers drop idle/long connections: reconnect once and retry.
++                try:
++                    client = _connect(target)
++                    client.send_message(msg)
++                    errors.append(None)
++                except Exception as exc:  # noqa: BLE001
++                    errors.append(f"connection lost: {exc}")
++            except smtplib.SMTPRecipientsRefused as exc:
++                detail = "; ".join(
++                    f"{code} {msg_.decode(errors='replace') if isinstance(msg_, bytes) else msg_}"
++                    for code, msg_ in exc.recipients.values()
++                )
++                errors.append(f"recipient refused: {detail}")
++            except smtplib.SMTPException as exc:
++                errors.append(f"SMTP error: {exc}")
++            except OSError as exc:
++                errors.append(f"network error: {exc}")
++    finally:
++        try:
++            client.quit()
++        except Exception:  # noqa: BLE001
++            pass
++
++    return errors
+ 
+ 
+ def send_email(
+@@ -60,12 +206,14 @@ def send_email(
+     body: str,
+ ) -> None:
+     """
+-    Dispatch send based on EMAIL_MODE: 'mock' vs 'real'.
++    Backwards-compatible helper: sends the same content as one message PER
++    recipient. Raises EmailSendError if any recipient failed.
+     """
+-    mode = _settings.email_mode.lower()
+-    if mode == "mock":
+-        return send_email_mock(sender, recipients, subject, body)
+-    if mode == "real":
+-        return send_email_real(sender, recipients, subject, body)
+-
+-    raise EmailSendError(f"Unsupported EMAIL_MODE: {mode}")
++    items = [OutgoingEmail(to=r, subject=subject, body=body) for r in recipients]
++    errors = send_individual_emails(sender, items)
++    failed = {i.to: e for i, e in zip(items, errors) if e}
++    if failed:
++        first_to, first_err = next(iter(failed.items()))
++        raise EmailSendError(
++            f"{len(failed)} of {len(items)} messages failed (first: {first_to}: {first_err})"
++        )
+diff --git a/backend/app/langgraph_state.py b/backend/app/langgraph_state.py
+index bc1a8b2..d2ca90e 100644
+--- a/backend/app/langgraph_state.py
++++ b/backend/app/langgraph_state.py
+@@ -1,6 +1,6 @@
+ from __future__ import annotations
+ 
+-from typing import Any, List, Literal, Optional
++from typing import Any, Dict, List, Literal, Optional
+ 
+ from pydantic import BaseModel
+ 
+@@ -19,9 +19,11 @@ class DraftSummary(BaseModel):
+ 
+ class SendSummary(BaseModel):
+     sender: str
+-    recipients: List[str]
++    recipients: List[str]  # addresses successfully emailed during this run
+     subject: str
+     count: int
++    failed: Dict[str, str] = {}  # address -> error, for recipients that failed
++    already_sent: List[str] = []  # skipped: delivered by an earlier run
+ 
+ 
+ class WorkflowState(BaseModel):
+diff --git a/backend/app/langgraph_workflow.py b/backend/app/langgraph_workflow.py
+index d5fea4c..69ab90c 100644
+--- a/backend/app/langgraph_workflow.py
++++ b/backend/app/langgraph_workflow.py
+@@ -8,7 +8,8 @@ from sqlalchemy.orm import Session
+ 
+ from .langgraph_state import DraftSummary, SubscriberState, WorkflowState, SendSummary
+ from .models import DraftEmail, Newsletter, Subscriber, SubscriberTopic, WorkflowExecution
+-from .email_sender import send_email, EmailSendError
++from .delivery import deliver_newsletter_drafts
++from .email_sender import EmailSendError, get_sender_address
+ 
+ 
+ class WorkflowGraphError(Exception):
+@@ -95,8 +96,9 @@ def build_workflow_graph(db: Session) -> StateGraph[WorkflowState]:
+             )
+ 
+             if existing:
+-                existing.subject = subject
+-                existing.body = body
++                if existing.status != "sent":
++                    existing.subject = subject
++                    existing.body = body
+                 draft = existing
+             else:
+                 draft = DraftEmail(
+@@ -135,22 +137,29 @@ def build_workflow_graph(db: Session) -> StateGraph[WorkflowState]:
+                 "sending blocked."
+             )
+ 
+-        sender = "newsletter-orchestrator@example.com"
+-        recipients = [s.email for s in state.subscribers]
+-        subject = newsletter.title
+-        # For simplicity, reuse newsletter.body; in practice, use refined drafts per subscriber.
+-        body = newsletter.body
+-
+         try:
+-            send_email(sender, recipients, subject, body)
++            sender = get_sender_address()
++            outcome = deliver_newsletter_drafts(
++                db, newsletter.id, state.subscribers, sender
++            )
+         except EmailSendError as exc:
+             raise WorkflowGraphError(f"Email sending failed: {exc}") from exc
+ 
++        # Nothing delivered and nothing delivered earlier: this is a real failure.
++        if outcome.failed and not outcome.sent and not outcome.already_sent:
++            first_to, first_err = next(iter(outcome.failed.items()))
++            raise WorkflowGraphError(
++                f"Email sending failed for all {len(outcome.failed)} recipients "
++                f"(first: {first_to}: {first_err})"
++            )
++
+         state.send_summary = SendSummary(
+             sender=sender,
+-            recipients=recipients,
+-            subject=subject,
+-            count=len(recipients),
++            recipients=outcome.sent,
++            subject=newsletter.title,
++            count=len(outcome.sent),
++            failed=outcome.failed,
++            already_sent=outcome.already_sent,
+         )
+         return state
+ 
+@@ -163,7 +172,8 @@ def build_workflow_graph(db: Session) -> StateGraph[WorkflowState]:
+ 
+         wf.state = "completed"
+         wf.completed_at = datetime.utcnow()
+-        newsletter.status = "sent"
++        has_failures = bool(state.send_summary and state.send_summary.failed)
++        newsletter.status = "partially_sent" if has_failures else "sent"
+         db.flush()
+ 
+         return state
+diff --git a/backend/app/routes_workflows.py b/backend/app/routes_workflows.py
+index 492a64a..17a530a 100644
+--- a/backend/app/routes_workflows.py
++++ b/backend/app/routes_workflows.py
+@@ -68,6 +68,8 @@ def run_newsletter_workflow(
+             "recipients": result_state.send_summary.recipients,
+             "subject": result_state.send_summary.subject,
+             "count": result_state.send_summary.count,
++            "failed": result_state.send_summary.failed,
++            "already_sent": result_state.send_summary.already_sent,
+         }
+ 
+     return {
+@@ -128,6 +130,8 @@ def run_ai_newsletter_workflow(
+             "recipients": result_state.send_summary.recipients,
+             "subject": result_state.send_summary.subject,
+             "count": result_state.send_summary.count,
++            "failed": result_state.send_summary.failed,
++            "already_sent": result_state.send_summary.already_sent,
+         }
+ 
+     return {
+diff --git a/backend/app/schedule_service.py b/backend/app/schedule_service.py
+index ceaad39..a4dc756 100644
+--- a/backend/app/schedule_service.py
++++ b/backend/app/schedule_service.py
+@@ -1,9 +1,12 @@
+ from __future__ import annotations
+ 
+ import json
++import logging
+ from datetime import datetime, timezone
+ from uuid import uuid4
+ 
++from fastapi import HTTPException
++from sqlalchemy.exc import IntegrityError
+ from sqlalchemy.orm import Session
+ 
+ from .ai_newsletter_service import AIServiceError, classify_newsletter_text
+@@ -16,7 +19,7 @@ from .models import Newsletter, NewsletterSchedule, ScheduleRun
+ from .news_ingestion import NewsArticle, get_articles
+ from .routes_workflows import run_newsletter_workflow, run_ai_newsletter_workflow
+ from .scheduler_logic import (
+-    is_schedule_due,
++    get_due_instance,
+     schedule_delivery_window_key,
+ )
+ from .schemas import NewsletterCreate
+@@ -25,6 +28,9 @@ from .schemas import NewsletterCreate
+ REVIEW_REQUIRED_RISK_LEVELS = {"high", "critical"}
+ 
+ 
++LOGGER = logging.getLogger("newsletter_scheduler")
++
++
+ class ScheduleExecutionError(Exception):
+     pass
+ 
+@@ -143,135 +149,130 @@ def _create_run(
+     return run
+ 
+ 
+-def _run_schedule(
++def _describe_error(exc: BaseException) -> str:
++    """Human-readable error text, including the underlying cause when wrapped."""
++    if isinstance(exc, HTTPException):
++        text = str(exc.detail)
++    else:
++        text = f"{type(exc).__name__}: {exc}"
++    cause = exc.__cause__
++    if cause is not None and str(cause) not in text:
++        text += f" (cause: {type(cause).__name__}: {cause})"
++    return text[:1500]
++
++
++def _outcome_from_workflow(newsletter_id: int, result_info: dict) -> tuple[str, str]:
++    """Derive the run status from what the workflow actually did."""
++    decision = result_info.get("ai_send_decision")
++    if decision == "skip":
++        return (
++            "skipped_low_relevance",
++            f"Newsletter #{newsletter_id} was skipped: its AI relevance score was "
++            "below the threshold. Nothing was sent.",
++        )
++    if decision == "review":
++        return (
++            "pending_review",
++            f"Newsletter #{newsletter_id} was held for human review by the AI "
++            "risk assessment. Nothing was sent.",
++        )
++
++    summary = result_info.get("send_summary") or {}
++    failed = summary.get("failed") or {}
++    if failed:
++        first_to, first_err = next(iter(failed.items()))
++        return (
++            "partial_failure",
++            f"Newsletter #{newsletter_id}: {summary.get('count', 0)} sent, "
++            f"{len(failed)} failed (first: {first_to}: {first_err}).",
++        )
++
++    return (
++        "sent",
++        f"Newsletter #{newsletter_id} was sent through the bounded schedule workflow.",
++    )
++
++
++def _execute_schedule_run(
+     db: Session,
+     schedule: NewsletterSchedule,
+-    run_key: str,
++    run: ScheduleRun,
+     now_utc: datetime,
+-    started_message: str,
+ ) -> dict:
+-    run = _create_run(
+-        db,
+-        schedule,
+-        run_key,
+-        started_message,
+-    )
++    """The actual work of one run. Raises on failure; see _run_schedule."""
++    topics, sources = _schedule_values(schedule)
+ 
+     try:
+-        topics, sources = _schedule_values(schedule)
+-
+-        try:
+-            article = _first_unseen_article(db, sources, topics)
+-        except RelevanceScorerError as exc:
+-            run.status = "failed_ai_relevance"
+-            run.message = (
+-                "AI relevance verification was unavailable; "
+-                f"no newsletter was created or sent. Details: {exc}"
+-            )
+-            run.completed_at = _utc_now()
+-            schedule.last_run_at = now_utc
+-            db.flush()
+-
+-            return {
+-                "status": run.status,
+-                "schedule_id": schedule.id,
+-                "run": _serialize_run(run),
+-                "newsletter": None,
+-            }
+-
+-        if article is None:
+-            run.status = "skipped_no_relevant_articles"
+-            run.message = (
+-                "No unseen relevant articles are available for this "
+-                "schedule's configured sources and topics."
+-            )
+-            run.completed_at = _utc_now()
+-            schedule.last_run_at = now_utc
+-            db.flush()
+-
+-            return {
+-                "status": run.status,
+-                "schedule_id": schedule.id,
+-                "run": _serialize_run(run),
+-                "newsletter": None,
+-            }
+-
+-        payload = NewsletterCreate(
+-            title=article.title,
+-            topic=article.topic,
+-            body=article.body,
+-            source=article.source,
+-            source_external_id=article.external_id,
+-            source_url=article.url,
+-            content_hash=article.content_hash,
++        article = _first_unseen_article(db, sources, topics)
++    except RelevanceScorerError as exc:
++        run.status = "failed_ai_relevance"
++        run.message = (
++            "AI relevance verification was unavailable; "
++            f"no newsletter was created or sent. Details: {exc}"
+         )
++        run.completed_at = _utc_now()
++        schedule.last_run_at = now_utc
++        db.flush()
+ 
+-        newsletter = create_newsletter(db, payload)
+-        create_workflow_execution_for_newsletter(db, newsletter)
++        return {
++            "status": run.status,
++            "schedule_id": schedule.id,
++            "run": _serialize_run(run),
++            "newsletter": None,
++        }
+ 
+-        try:
+-            classification = classify_newsletter_text(
+-                newsletter.title,
+-                newsletter.body,
+-            )
+-        except AIServiceError as exc:
+-            raise ScheduleExecutionError(
+-                f"Classification failed: {exc}"
+-            ) from exc
+-
+-        newsletter.risk_level = classification["risk_level"]
+-        newsletter.risk_reason = classification["reason"]
+-        run.newsletter_id = newsletter.id
++    if article is None:
++        run.status = "skipped_no_relevant_articles"
++        run.message = (
++            "No unseen relevant articles are available for this "
++            "schedule's configured sources and topics."
++        )
++        run.completed_at = _utc_now()
+         schedule.last_run_at = now_utc
++        db.flush()
+ 
+-        if newsletter.risk_level in REVIEW_REQUIRED_RISK_LEVELS:
+-            newsletter.status = "pending_review"
+-            newsletter.approved = False
+-            run.status = "pending_review"
+-            run.message = (
+-                f"Newsletter #{newsletter.id} requires human review: "
+-                f"{newsletter.risk_reason}"
+-            )
+-            run.completed_at = _utc_now()
+-            db.flush()
+-
+-            return {
+-                "status": run.status,
+-                "schedule_id": schedule.id,
+-                "run": _serialize_run(run),
+-                "newsletter": {
+-                    "id": newsletter.id,
+-                    "title": newsletter.title,
+-                    "risk_level": newsletter.risk_level,
+-                    "approved": newsletter.approved,
+-                    "status": newsletter.status,
+-                },
+-            }
++        return {
++            "status": run.status,
++            "schedule_id": schedule.id,
++            "run": _serialize_run(run),
++            "newsletter": None,
++        }
+ 
+-        newsletter.status = "approved"
+-        newsletter.approved = True
+-        db.flush()
++    payload = NewsletterCreate(
++        title=article.title,
++        topic=article.topic,
++        body=article.body,
++        source=article.source,
++        source_external_id=article.external_id,
++        source_url=article.url,
++        content_hash=article.content_hash,
++    )
+ 
+-        # Use AI workflow if configured
+-        from .config import load_settings
+-        settings = load_settings()
+-        
+-        if settings.workflow_mode.lower() == "ai":
+-            workflow_result = run_ai_newsletter_workflow(
+-                newsletter.id,
+-                db=db,
+-            )
+-        else:
+-            workflow_result = run_newsletter_workflow(
+-                newsletter.id,
+-                db=db,
+-            )
++    newsletter = create_newsletter(db, payload)
++    create_workflow_execution_for_newsletter(db, newsletter)
+ 
++    try:
++        classification = classify_newsletter_text(
++            newsletter.title,
++            newsletter.body,
++        )
++    except AIServiceError as exc:
++        raise ScheduleExecutionError(
++            f"Classification failed: {exc}"
++        ) from exc
++
++    newsletter.risk_level = classification["risk_level"]
++    newsletter.risk_reason = classification["reason"]
++    run.newsletter_id = newsletter.id
++    schedule.last_run_at = now_utc
+ 
+-        run.status = "sent"
++    if newsletter.risk_level in REVIEW_REQUIRED_RISK_LEVELS:
++        newsletter.status = "pending_review"
++        newsletter.approved = False
++        run.status = "pending_review"
+         run.message = (
+-            f"Newsletter #{newsletter.id} was sent through "
+-            "the bounded schedule workflow."
++            f"Newsletter #{newsletter.id} requires human review: "
++            f"{newsletter.risk_reason}"
+         )
+         run.completed_at = _utc_now()
+         db.flush()
+@@ -287,15 +288,92 @@ def _run_schedule(
+                 "approved": newsletter.approved,
+                 "status": newsletter.status,
+             },
+-            "workflow_result": workflow_result,
+         }
+ 
+-    except Exception as exc:
++    newsletter.status = "approved"
++    newsletter.approved = True
++    db.flush()
++
++    # Use AI workflow if configured
++    from .config import load_settings
++    settings = load_settings()
++
++    if settings.workflow_mode.lower() == "ai":
++        workflow_result = run_ai_newsletter_workflow(
++            newsletter.id,
++            db=db,
++        )
++    else:
++        workflow_result = run_newsletter_workflow(
++            newsletter.id,
++            db=db,
++        )
++
++
++    run.status, run.message = _outcome_from_workflow(
++        newsletter.id,
++        workflow_result.get("result", {}),
++    )
++    run.completed_at = _utc_now()
++    db.flush()
++
++    return {
++        "status": run.status,
++        "schedule_id": schedule.id,
++        "run": _serialize_run(run),
++        "newsletter": {
++            "id": newsletter.id,
++            "title": newsletter.title,
++            "risk_level": newsletter.risk_level,
++            "approved": newsletter.approved,
++            "status": newsletter.status,
++        },
++        "workflow_result": workflow_result,
++    }
++
++
++def _run_schedule(
++    db: Session,
++    schedule: NewsletterSchedule,
++    run_key: str,
++    now_utc: datetime,
++    started_message: str,
++) -> dict:
++    run = _create_run(
++        db,
++        schedule,
++        run_key,
++        started_message,
++    )
++    # Claim this delivery window durably BEFORE any side effect. If the process
++    # dies mid-run, the visible "running" row prevents a duplicate send on restart
++    # (and the unique run_key stops a second worker racing us).
++    db.commit()
++
++    try:
++        # Savepoint: if anything fails, only this attempt's newsletter/draft
++        # changes roll back. The run row created above survives.
++        with db.begin_nested():
++            return _execute_schedule_run(db, schedule, run, now_utc)
++    except Exception as exc:  # noqa: BLE001
++        message = _describe_error(exc)
++        LOGGER.exception(
++            "schedule_run_failed",
++            extra={"schedule_id": run.schedule_id, "run_key": run.run_key},
++        )
+         run.status = "failed"
+-        run.message = str(exc)
++        run.message = message
+         run.completed_at = _utc_now()
++        schedule.last_run_at = now_utc
+         db.flush()
+-        raise
++
++        return {
++            "status": run.status,
++            "schedule_id": schedule.id,
++            "run": _serialize_run(run),
++            "newsletter": None,
++            "message": message,
++        }
+ 
+ 
+ def run_schedule_now(
+@@ -318,6 +396,76 @@ def run_schedule_now(
+     )
+ 
+ 
++def _record_invalid_schedule(
++    db: Session,
++    schedule: NewsletterSchedule,
++    now_utc: datetime,
++    exc: Exception,
++) -> dict | None:
++    """A malformed schedule is recorded once per day instead of breaking the scan."""
++    run_key = f"schedule-{schedule.id}-invalid-{now_utc.date().isoformat()}"
++    if _existing_run_for_key(db, run_key) is not None:
++        return None
++
++    run = ScheduleRun(
++        schedule_id=schedule.id,
++        run_key=run_key,
++        status="failed",
++        message=f"Invalid schedule configuration: {exc}",
++        completed_at=_utc_now(),
++    )
++    db.add(run)
++    db.flush()
++    return {
++        "status": "failed",
++        "schedule_id": schedule.id,
++        "run": _serialize_run(run),
++        "message": run.message,
++    }
++
++
++def _scan_one_schedule(
++    db: Session,
++    schedule: NewsletterSchedule,
++    now_utc: datetime,
++) -> dict | None:
++    try:
++        due_at = get_due_instance(schedule, now_utc)
++    except ValueError as exc:
++        return _record_invalid_schedule(db, schedule, now_utc, exc)
++
++    if due_at is None:
++        return None
++
++    run_key = schedule_delivery_window_key(schedule, now_utc)
++    existing_run = _existing_run_for_key(db, run_key)
++
++    if existing_run is not None:
++        return {
++            "status": "already_processed",
++            "schedule_id": schedule.id,
++            "run": _serialize_run(existing_run),
++        }
++
++    try:
++        return _run_schedule(
++            db=db,
++            schedule=schedule,
++            run_key=run_key,
++            now_utc=now_utc,
++            started_message="Scheduled delivery window started.",
++        )
++    except IntegrityError:
++        # Another worker claimed the same window between our check and insert.
++        db.rollback()
++        existing_run = _existing_run_for_key(db, run_key)
++        return {
++            "status": "already_processed",
++            "schedule_id": schedule.id,
++            "run": _serialize_run(existing_run) if existing_run else None,
++        }
++
++
+ def scan_due_schedules_once(
+     db: Session,
+     now_utc: datetime | None = None,
+@@ -340,41 +488,25 @@ def scan_due_schedules_once(
+     results: list[dict] = []
+ 
+     for schedule in schedules:
+-        if not is_schedule_due(schedule, now_utc):
+-            continue
+-
+-        run_key = schedule_delivery_window_key(schedule, now_utc)
+-        existing_run = _existing_run_for_key(db, run_key)
+-
+-        if existing_run is not None:
+-            results.append(
+-                {
+-                    "status": "already_processed",
+-                    "schedule_id": schedule.id,
+-                    "run": _serialize_run(existing_run),
+-                }
+-            )
+-            continue
+-
++        schedule_id = schedule.id
+         try:
+-            result = _run_schedule(
+-                db=db,
+-                schedule=schedule,
+-                run_key=run_key,
+-                now_utc=now_utc,
+-                started_message="Scheduled delivery window started.",
++            result = _scan_one_schedule(db, schedule, now_utc)
++            # Make each schedule's outcome durable immediately: a later schedule
++            # failing must never roll back (and so re-send) an earlier one.
++            db.commit()
++        except Exception as exc:  # noqa: BLE001 - one schedule must not stop the scan
++            db.rollback()
++            LOGGER.exception(
++                "schedule_scan_item_failed", extra={"schedule_id": schedule_id}
+             )
+-        except ScheduleExecutionError as exc:
+-            results.append(
+-                {
+-                    "status": "failed",
+-                    "schedule_id": schedule.id,
+-                    "message": str(exc),
+-                }
+-            )
+-            continue
++            result = {
++                "status": "failed",
++                "schedule_id": schedule_id,
++                "message": _describe_error(exc),
++            }
+ 
+-        results.append(result)
++        if result is not None:
++            results.append(result)
+ 
+     return {
+         "scanned_at": now_utc.isoformat(),
+diff --git a/backend/app/scheduler_logic.py b/backend/app/scheduler_logic.py
+index 05e8d3e..9b71066 100644
+--- a/backend/app/scheduler_logic.py
++++ b/backend/app/scheduler_logic.py
+@@ -1,8 +1,9 @@
+ from __future__ import annotations
+ 
+-from datetime import datetime, timezone
++from datetime import datetime, time, timedelta, timezone
+ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+ 
++from .config import load_settings
+ from .models import NewsletterSchedule
+ 
+ 
+@@ -47,16 +48,87 @@ def parse_delivery_time(delivery_time: str) -> tuple[int, int]:
+     return hour, minute
+ 
+ 
++def _parse_weekdays(schedule: NewsletterSchedule) -> set[int]:
++    try:
++        return {
++            int(day)
++            for day in schedule.weekdays_json.strip("[]").split(",")
++            if day.strip()
++        }
++    except ValueError as exc:
++        raise ValueError(
++            f"Invalid weekdays configuration for schedule #{schedule.id}"
++        ) from exc
++
++
++def get_due_instance(
++    schedule: NewsletterSchedule,
++    now_utc: datetime,
++    catchup_minutes: int | None = None,
++) -> datetime | None:
++    """
++    Return the scheduled delivery moment (timezone-aware, in the schedule's own
++    timezone) that is currently due, or None.
++
++    A delivery is due from its scheduled minute until ``catchup_minutes`` minutes
++    after that minute ends. ``catchup_minutes=0`` reproduces the old exact-minute
++    behaviour. The look-back covers the previous local day so a 23:58 delivery is
++    still caught by a scan at 00:03.
++
++    Raises ValueError / ScheduleTimezoneError for a malformed schedule.
++    """
++    if not schedule.enabled:
++        return None
++
++    if catchup_minutes is None:
++        catchup_minutes = load_settings().schedule_catchup_minutes
++
++    if now_utc.tzinfo is None:
++        now_utc = now_utc.replace(tzinfo=timezone.utc)
++    else:
++        now_utc = now_utc.astimezone(timezone.utc)
++
++    local_now = schedule_local_time(schedule, now_utc)
++    hour, minute = parse_delivery_time(schedule.delivery_time)
++    weekdays = _parse_weekdays(schedule)
++    window = timedelta(minutes=catchup_minutes + 1)
++
++    for days_back in (0, 1):
++        day = local_now.date() - timedelta(days=days_back)
++        if day.weekday() not in weekdays:
++            continue
++
++        scheduled_local = datetime.combine(
++            day, time(hour, minute), tzinfo=local_now.tzinfo
++        )
++        age = now_utc - scheduled_local.astimezone(timezone.utc)
++        if timedelta(0) <= age < window:
++            return scheduled_local
++
++    return None
++
++
+ def schedule_delivery_window_key(
+     schedule: NewsletterSchedule,
+     now_utc: datetime,
++    catchup_minutes: int | None = None,
+ ) -> str:
+-    local_now = schedule_local_time(schedule, now_utc)
++    """
++    Idempotency key for one scheduled delivery. It is derived from the scheduled
++    moment, not from "now", so every scan inside the catch-up window maps to the
++    same key and a delivery can only run once.
++    """
+     hour, minute = parse_delivery_time(schedule.delivery_time)
++    instance = get_due_instance(schedule, now_utc, catchup_minutes)
++    day = (
++        instance.date()
++        if instance is not None
++        else schedule_local_time(schedule, now_utc).date()
++    )
+ 
+     return (
+         f"schedule-{schedule.id}-"
+-        f"{local_now.date().isoformat()}-"
++        f"{day.isoformat()}-"
+         f"{hour:02d}{minute:02d}-"
+         f"{schedule.timezone}"
+     )
+@@ -65,26 +137,6 @@ def schedule_delivery_window_key(
+ def is_schedule_due(
+     schedule: NewsletterSchedule,
+     now_utc: datetime,
++    catchup_minutes: int | None = None,
+ ) -> bool:
+-    if not schedule.enabled:
+-        return False
+-
+-    local_now = schedule_local_time(schedule, now_utc)
+-    hour, minute = parse_delivery_time(schedule.delivery_time)
+-
+-    try:
+-        weekdays = {
+-            int(day)
+-            for day in schedule.weekdays_json.strip("[]").split(",")
+-            if day.strip()
+-        }
+-    except ValueError as exc:
+-        raise ValueError(
+-            f"Invalid weekdays configuration for schedule #{schedule.id}"
+-        ) from exc
+-
+-    return (
+-        local_now.weekday() in weekdays
+-        and local_now.hour == hour
+-        and local_now.minute == minute
+-    )
++    return get_due_instance(schedule, now_utc, catchup_minutes) is not None
+diff --git a/backend/app/scheduler_worker.py b/backend/app/scheduler_worker.py
+index c49cb4f..1a756cc 100644
+--- a/backend/app/scheduler_worker.py
++++ b/backend/app/scheduler_worker.py
+@@ -33,14 +33,26 @@ def scan_once() -> dict:
+             now_utc=now_utc,
+         )
+ 
++    statuses: dict[str, int] = {}
++    for item in result["results"]:
++        statuses[item["status"]] = statuses.get(item["status"], 0) + 1
++
++    # 'already_processed' repeats on every scan inside the catch-up window; keep
++    # it out of the headline so real activity stands out.
++    notable = {k: v for k, v in statuses.items() if k != "already_processed"}
+     LOGGER.info(
+-        "scheduler_scan_complete",
+-        extra={
+-            "scanned_at": result["scanned_at"],
+-            "due_schedule_count": result["due_schedule_count"],
+-            "results": result["results"],
+-        },
++        "scheduler_scan_complete due=%s notable=%s",
++        result["due_schedule_count"],
++        notable or "none",
+     )
++    for item in result["results"]:
++        if item["status"] in {"failed", "partial_failure"}:
++            LOGGER.error(
++                "schedule_%s schedule_id=%s detail=%s",
++                item["status"],
++                item.get("schedule_id"),
++                item.get("message") or (item.get("run") or {}).get("message"),
++            )
+     return result
+ 
+ 
+diff --git a/tests/backend/test_delivery_and_resilience.py b/tests/backend/test_delivery_and_resilience.py
+new file mode 100644
+index 0000000..4365ff2
+--- /dev/null
++++ b/tests/backend/test_delivery_and_resilience.py
+@@ -0,0 +1,621 @@
++"""
++Tests for: real SMTP delivery (one message per subscriber), persisted failed runs,
++scan resilience, the schedule catch-up window, and the AI workflow fixes.
++
++Design notes
++- SMTP behaviour is tested against a fake smtplib, so no mail server is needed.
++- Workflow/scheduler tests patch ``delivery.send_individual_emails`` with a recorder
++  and assert only on addresses they create, because the shared dev database may
++  already hold other subscribers/schedules.
++- Scheduler tests inject a unique article instead of relying on stub articles,
++  which earlier runs may already have "consumed".
++"""
++from __future__ import annotations
++
++import json
++import smtplib
++from datetime import datetime, timezone
++from uuid import uuid4
++
++import pytest
++from fastapi.testclient import TestClient
++
++from backend.app import delivery, email_sender, schedule_service
++from backend.app.config import Settings, load_settings
++from backend.app.db import get_session
++from backend.app.email_sender import EmailSendError, OutgoingEmail
++from backend.app.main import app
++from backend.app.models import (
++    DraftEmail,
++    Newsletter,
++    NewsletterSchedule,
++    ScheduleRun,
++    Subscriber,
++    SubscriberTopic,
++)
++from backend.app.news_ingestion import STUB_ARTICLES, NewsArticle
++
++client = TestClient(app)
++
++
++def uid(prefix: str) -> str:
++    return f"{prefix}-{uuid4().hex[:10]}"
++
++
++# ---------------------------------------------------------------------------
++# Fake SMTP
++# ---------------------------------------------------------------------------
++class FakeSMTP:
++    instances: list["FakeSMTP"] = []
++    refuse: set[str] = set()
++    fail_connect = False
++    reject_login = False
++
++    def __init__(self, host, port, timeout=None, context=None):
++        if FakeSMTP.fail_connect:
++            raise ConnectionRefusedError("[Errno 111] Connection refused")
++        self.host, self.port, self.timeout = host, port, timeout
++        self.kind = "plain"
++        self.starttls_called = False
++        self.login_args = None
++        self.messages = []
++        self.closed = False
++        FakeSMTP.instances.append(self)
++
++    def ehlo(self):
++        pass
++
++    def starttls(self, context=None):
++        self.starttls_called = True
++
++    def login(self, user, password):
++        if FakeSMTP.reject_login:
++            raise smtplib.SMTPAuthenticationError(535, b"bad credentials")
++        self.login_args = (user, password)
++
++    def send_message(self, msg):
++        for addr in FakeSMTP.refuse:
++            if addr in str(msg["To"]):
++                raise smtplib.SMTPRecipientsRefused({addr: (550, b"no such user")})
++        self.messages.append(msg)
++
++    def quit(self):
++        self.closed = True
++
++
++class FakeSMTPSSL(FakeSMTP):
++    def __init__(self, host, port, timeout=None, context=None):
++        super().__init__(host, port, timeout=timeout, context=context)
++        self.kind = "ssl"
++
++
++@pytest.fixture()
++def fake_smtp(monkeypatch):
++    FakeSMTP.instances = []
++    FakeSMTP.refuse = set()
++    FakeSMTP.fail_connect = False
++    FakeSMTP.reject_login = False
++    monkeypatch.setattr(email_sender.smtplib, "SMTP", FakeSMTP)
++    monkeypatch.setattr(email_sender.smtplib, "SMTP_SSL", FakeSMTPSSL)
++    return FakeSMTP
++
++
++def smtp_settings(**overrides) -> Settings:
++    base = dict(
++        email_mode="smtp",
++        smtp_host="smtp.provider.test",
++        smtp_username="user",
++        smtp_password="secret",
++        email_from="news@mydomain.org",
++    )
++    base.update(overrides)
++    return Settings(**base)
++
++
++def items(*addresses: str) -> list[OutgoingEmail]:
++    return [OutgoingEmail(to=a, subject="Subj", body="Body") for a in addresses]
++
++
++# ---------------------------------------------------------------------------
++# email_sender
++# ---------------------------------------------------------------------------
++def test_each_recipient_gets_their_own_message(fake_smtp):
++    errors = email_sender.send_individual_emails(
++        "news@mydomain.org",
++        items("a@x.com", "b@x.com", "c@x.com"),
++        settings=Settings(email_mode="mock"),
++    )
++
++    assert errors == [None, None, None]
++    assert len(fake_smtp.instances) == 1  # one connection for the whole batch
++    sent = fake_smtp.instances[0].messages
++    assert [str(m["To"]) for m in sent] == ["a@x.com", "b@x.com", "c@x.com"]
++    for m in sent:  # nobody can see anybody else's address
++        assert m["Cc"] is None and m["Bcc"] is None
++        assert m["Message-ID"] and m["Date"]
++    assert fake_smtp.instances[0].closed
++
++
++def test_one_refused_recipient_does_not_stop_the_batch(fake_smtp):
++    fake_smtp.refuse = {"bad@x.com"}
++
++    errors = email_sender.send_individual_emails(
++        "news@mydomain.org",
++        items("a@x.com", "bad@x.com", "c@x.com"),
++        settings=Settings(email_mode="mock"),
++    )
++
++    assert errors[0] is None and errors[2] is None
++    assert "recipient refused" in errors[1] and "550" in errors[1]
++
++
++def test_header_injection_is_rejected_per_message(fake_smtp):
++    batch = [
++        OutgoingEmail(to="a@x.com", subject="Hi\nBcc: evil@x.com", body="b"),
++        OutgoingEmail(to="b@x.com", subject="Fine", body="b"),
++    ]
++    errors = email_sender.send_individual_emails(
++        "news@mydomain.org", batch, settings=Settings(email_mode="mock")
++    )
++
++    assert errors[0] and "invalid message" in errors[0]
++    assert errors[1] is None
++
++
++def test_unreachable_server_raises_a_clear_error(fake_smtp):
++    fake_smtp.fail_connect = True
++    with pytest.raises(EmailSendError, match="Could not connect"):
++        email_sender.send_individual_emails(
++            "news@mydomain.org", items("a@x.com"), settings=Settings(email_mode="mock")
++        )
++
++
++def test_rejected_login_raises_a_clear_error(fake_smtp):
++    fake_smtp.reject_login = True
++    with pytest.raises(EmailSendError, match="login rejected"):
++        email_sender.send_individual_emails(
++            "news@mydomain.org", items("a@x.com"), settings=smtp_settings()
++        )
++
++
++def test_starttls_is_the_default_with_login_and_port_587(fake_smtp):
++    email_sender.send_individual_emails(
++        "news@mydomain.org", items("a@x.com"), settings=smtp_settings()
++    )
++    conn = fake_smtp.instances[0]
++    assert (conn.host, conn.port, conn.kind) == ("smtp.provider.test", 587, "plain")
++    assert conn.starttls_called is True
++    assert conn.login_args == ("user", "secret")
++
++
++def test_ssl_mode_uses_smtps_on_465(fake_smtp):
++    email_sender.send_individual_emails(
++        "news@mydomain.org", items("a@x.com"), settings=smtp_settings(smtp_security="ssl")
++    )
++    conn = fake_smtp.instances[0]
++    assert (conn.kind, conn.port, conn.starttls_called) == ("ssl", 465, False)
++
++
++def test_mock_mode_never_reaches_the_real_provider(fake_smtp):
++    email_sender.send_individual_emails(
++        "news@mydomain.org",
++        items("a@x.com"),
++        settings=Settings(
++            email_mode="mock", smtp_host="smtp.prod.example", smtp_username="u", smtp_password="p"
++        ),
++    )
++    conn = fake_smtp.instances[0]
++    assert (conn.host, conn.port) == ("127.0.0.1", 1025)
++    assert conn.login_args is None and conn.starttls_called is False
++
++
++@pytest.mark.parametrize(
++    "overrides, message",
++    [
++        (dict(smtp_host=None), "SMTP_HOST"),
++        (dict(smtp_password=None), "together"),
++        (dict(email_mode="carrier-pigeon"), "Unsupported EMAIL_MODE"),
++    ],
++)
++def test_bad_smtp_configuration_is_reported(fake_smtp, overrides, message):
++    with pytest.raises(EmailSendError, match=message):
++        email_sender.send_individual_emails(
++            "news@mydomain.org", items("a@x.com"), settings=smtp_settings(**overrides)
++        )
++
++
++def test_real_is_an_alias_and_a_placeholder_sender_is_refused_for_real_delivery():
++    assert email_sender.get_sender_address(smtp_settings(email_mode="real")) == "news@mydomain.org"
++    with pytest.raises(EmailSendError, match="EMAIL_FROM"):
++        email_sender.get_sender_address(smtp_settings(email_from="newsletter-orchestrator@example.com"))
++    # mock mode keeps the harmless default
++    assert email_sender.get_sender_address(Settings(email_mode="mock")).endswith("@example.com")
++
++
++def test_settings_read_the_documented_environment_variables(monkeypatch):
++    monkeypatch.setenv("RELEVANCE_THRESHOLD", "0.9")
++    monkeypatch.setenv("EMAIL_MODE", "SMTP")
++    monkeypatch.setenv("SMTP_PORT", "2525")
++    monkeypatch.setenv("SMTP_SECURITY", "SSL")
++    monkeypatch.setenv("SCHEDULE_CATCHUP_MINUTES", "30")
++    s = load_settings()
++    assert (s.relevance_threshold, s.email_mode, s.smtp_port) == (0.9, "smtp", 2525)
++    assert (s.smtp_security, s.schedule_catchup_minutes) == ("ssl", 30)
++
++    monkeypatch.setenv("SMTP_SECURITY", "carrier-pigeon")
++    with pytest.raises(RuntimeError, match="Invalid configuration"):
++        load_settings()
++
++
++# ---------------------------------------------------------------------------
++# Workflow delivery: per-subscriber, idempotent, partial failure
++# ---------------------------------------------------------------------------
++class Recorder:
++    """Stands in for delivery.send_individual_emails."""
++
++    def __init__(self):
++        self.sent: list[OutgoingEmail] = []
++        self.fail: dict[str, str] = {}
++        self.raise_once: Exception | None = None
++        self.calls = 0
++
++    def __call__(self, sender, batch, settings=None):
++        self.calls += 1
++        if self.raise_once is not None:
++            exc, self.raise_once = self.raise_once, None
++            raise exc
++        out = []
++        for item in batch:
++            if item.to in self.fail:
++                out.append(self.fail[item.to])
++            else:
++                self.sent.append(item)
++                out.append(None)
++        return out
++
++    def to(self, *addresses: str) -> list[str]:
++        return [i.to for i in self.sent if i.to in addresses]
++
++
++@pytest.fixture()
++def recorder(monkeypatch):
++    rec = Recorder()
++    monkeypatch.setattr(delivery, "send_individual_emails", rec)
++    return rec
++
++
++def make_subscriber(topic: str = "ai_news") -> str:
++    email = f"{uid('sub')}@example.com"
++    r = client.post("/api/subscribers", json={"email": email, "name": "Sub", "topics": [topic]})
++    assert r.status_code == 201
++    return email
++
++
++def make_approved_newsletter(**extra) -> int:
++    payload = {
++        "title": uid("Newsletter"),
++        "topic": "ai_news",
++        "body": "A calm update on reliable language-model evaluation.",
++    }
++    payload.update(extra)
++    nid = client.post("/api/newsletters", json=payload).json()["id"]
++    assert client.post(f"/api/newsletters/{nid}/classify-and-store").status_code == 200
++    assert client.post(f"/api/newsletters/{nid}/approve").status_code == 200
++    return nid
++
++
++def newsletter_status(nid: int) -> str:
++    with get_session() as db:
++        return db.get(Newsletter, nid).status
++
++
++def test_run_sends_one_message_per_subscriber_and_never_twice(recorder):
++    a, b = make_subscriber(), make_subscriber()
++    nid = make_approved_newsletter()
++
++    first = client.post(f"/api/workflows/newsletter/{nid}/run")
++    assert first.status_code == 200
++    assert sorted(recorder.to(a, b)) == sorted([a, b])  # exactly one each
++    assert newsletter_status(nid) == "sent"
++
++    again = client.post(f"/api/workflows/newsletter/{nid}/run")
++    assert again.status_code == 200
++    assert sorted(recorder.to(a, b)) == sorted([a, b])  # still one each: nothing re-sent
++    summary = again.json()["result"]["send_summary"]
++    assert {a, b} <= set(summary["already_sent"])
++    assert summary["count"] == 0
++
++
++def test_each_subscriber_receives_their_own_personalised_draft(recorder):
++    a = make_subscriber()
++    nid = make_approved_newsletter()
++    client.post(f"/api/workflows/newsletter/{nid}/run")
++
++    with get_session() as db:
++        sub = db.query(Subscriber).filter(Subscriber.email == a).one()
++        draft = db.query(DraftEmail).filter_by(newsletter_id=nid, subscriber_id=sub.id).one()
++        assert draft.status == "sent"
++        sent = next(i for i in recorder.sent if i.to == a)
++        assert (sent.subject, sent.body) == (draft.subject, draft.body)
++
++
++def test_partial_failure_is_reported_and_a_retry_only_resends_the_failed_one(recorder):
++    ok, bad = make_subscriber(), make_subscriber()
++    recorder.fail[bad] = "recipient refused: 550 no such user"
++    nid = make_approved_newsletter()
++
++    r = client.post(f"/api/workflows/newsletter/{nid}/run")
++    assert r.status_code == 200
++    summary = r.json()["result"]["send_summary"]
++    assert summary["failed"][bad].startswith("recipient refused")
++    assert recorder.to(ok, bad) == [ok]
++    assert newsletter_status(nid) == "partially_sent"
++
++    recorder.fail.clear()  # the problem is fixed; run again
++    r = client.post(f"/api/workflows/newsletter/{nid}/run")
++    assert r.status_code == 200
++    assert sorted(recorder.to(ok, bad)) == sorted([ok, bad])  # ok NOT re-sent, bad now sent
++    assert newsletter_status(nid) == "sent"
++
++
++def test_total_delivery_failure_is_an_error_not_a_silent_success(recorder):
++    make_subscriber()
++    recorder.raise_once = EmailSendError("Could not connect to SMTP smtp.provider.test:587: boom")
++    nid = make_approved_newsletter()
++
++    r = client.post(f"/api/workflows/newsletter/{nid}/run")
++    assert r.status_code == 400
++    assert "boom" in r.json()["detail"]
++
++
++# ---------------------------------------------------------------------------
++# Scheduler: persisted failures, resilient scan, catch-up window
++# ---------------------------------------------------------------------------
++# 2026-08-17 is a Monday. 09:17 Europe/Berlin (CEST, UTC+2) == 07:17 UTC.
++SCHEDULED_UTC = datetime(2026, 8, 17, 7, 17, 5, tzinfo=timezone.utc)
++
++
++def at(minutes_after: int) -> datetime:
++    return SCHEDULED_UTC.replace(minute=17 + minutes_after)
++
++
++@pytest.fixture()
++def schedules():
++    """Create schedules for a test and remove them (and their runs) afterwards."""
++    created: list[int] = []
++
++    def make(delivery_time="09:17", tz="Europe/Berlin") -> int:
++        with get_session() as db:
++            s = NewsletterSchedule(
++                email=f"{uid('owner')}@example.com",
++                topics_json=json.dumps(["ai_news"]),
++                sources_json=json.dumps(["Spiegel"]),
++                weekdays_json=json.dumps(list(range(7))),
++                delivery_time=delivery_time,
++                timezone=tz,
++                enabled=True,
++            )
++            db.add(s)
++            db.flush()
++            created.append(s.id)
++            return s.id
++
++    yield make
++
++    with get_session() as db:
++        for sid in created:
++            obj = db.get(NewsletterSchedule, sid)
++            if obj is not None:
++                db.delete(obj)
++
++
++@pytest.fixture()
++def unique_article(monkeypatch):
++    """Every scheduled run gets its own fresh, AI-relevant article."""
++
++    def fake_first_unseen(db, sources, topics):
++        n = uid("art")
++        return NewsArticle(
++            source="spiegel_wissenschaft_technik",
++            external_id=n,
++            url=f"https://example.com/{n}",
++            published_at="2026-08-17T06:00:00+00:00",
++            topic="ai_news",
++            title=f"AI language model study {n}",
++            body="Researchers publish a calm study on a neural language model.",
++        )
++
++    monkeypatch.setattr(schedule_service, "_first_unseen_article", fake_first_unseen)
++
++
++def scan(now):
++    with get_session() as db:
++        return schedule_service.scan_due_schedules_once(db, now)
++
++
++def result_for(result, sid):
++    return next((r for r in result["results"] if r["schedule_id"] == sid), None)
++
++
++def runs_for(sid):
++    with get_session() as db:
++        return [(r.status, r.message, r.newsletter_id) for r in db.query(ScheduleRun).filter_by(schedule_id=sid)]
++
++
++def test_late_scan_inside_the_catchup_window_still_delivers(schedules, unique_article, recorder):
++    sub = make_subscriber()
++    sid = schedules()
++
++    late = result_for(scan(at(7)), sid)  # 7 minutes late: used to be silently lost
++    assert late["status"] == "sent"
++    assert recorder.to(sub) == [sub]
++
++    again = result_for(scan(at(9)), sid)  # later scan, same window
++    assert again["status"] == "already_processed"
++    assert recorder.to(sub) == [sub]  # no second send
++
++
++def test_scan_after_the_window_does_nothing(schedules, unique_article, recorder):
++    sid = schedules()
++    assert result_for(scan(at(40)), sid) is None
++
++
++def test_failed_run_is_persisted_and_not_retried_every_minute(schedules, unique_article, recorder):
++    make_subscriber()
++    sid = schedules()
++    recorder.raise_once = EmailSendError("Could not connect to SMTP: boom")
++
++    result = result_for(scan(at(0)), sid)  # the scan itself must not raise
++    assert result["status"] == "failed"
++    assert "boom" in result["message"]
++
++    runs = runs_for(sid)
++    assert len(runs) == 1
++    status, message, newsletter_id = runs[0]
++    assert status == "failed" and "boom" in message
++    assert newsletter_id is None  # the half-built newsletter was rolled back
++
++    calls = recorder.calls
++    assert result_for(scan(at(3)), sid)["status"] == "already_processed"
++    assert recorder.calls == calls  # no retry storm inside the window
++
++
++def test_one_failing_schedule_does_not_block_or_undo_the_others(schedules, unique_article, recorder):
++    sub = make_subscriber()
++    first, second = schedules(), schedules()
++    recorder.raise_once = EmailSendError("boom")  # only the first attempt fails
++
++    result = scan(at(0))
++    assert result_for(result, first)["status"] == "failed"
++    assert result_for(result, second)["status"] == "sent"
++
++    assert runs_for(first)[0][0] == "failed"  # both outcomes are durable
++    assert runs_for(second)[0][0] == "sent"
++    assert recorder.to(sub) == [sub]
++
++
++def test_unexpected_error_in_a_later_schedule_does_not_erase_an_earlier_send(
++    schedules, unique_article, recorder, monkeypatch
++):
++    sub = make_subscriber()
++    first, second = schedules(), schedules()
++
++    from backend.app import schedule_service as svc
++
++    real_due = svc.get_due_instance
++
++    def flaky_due(schedule, now_utc, *args, **kwargs):
++        if schedule.id == second:
++            raise RuntimeError("database exploded")  # not a config error
++        return real_due(schedule, now_utc, *args, **kwargs)
++
++    monkeypatch.setattr(svc, "get_due_instance", flaky_due)
++
++    result = scan(at(0))
++    assert result_for(result, first)["status"] == "sent"
++    assert result_for(result, second)["status"] == "failed"
++
++    # The first schedule's email already went out; its record must have survived
++    # the later rollback, otherwise the next scan in the window would re-send it.
++    assert runs_for(first)[0][0] == "sent"
++    monkeypatch.setattr(svc, "get_due_instance", real_due)  # the fault clears
++    later = scan(at(2))
++    assert result_for(later, first)["status"] == "already_processed"  # not re-sent
++    assert result_for(later, second)["status"] == "sent"  # recovered inside its window
++    assert len(runs_for(first)) == 1
++    # Exactly one email per schedule's own newsletter; the first was never duplicated.
++    assert len(recorder.to(sub)) == 2
++
++
++def test_a_malformed_schedule_cannot_break_the_scan(schedules, unique_article, recorder):
++    sub = make_subscriber()
++    broken = schedules(tz="Mars/Olympus_Mons")
++    good = schedules()
++
++    result = scan(at(0))
++    assert result_for(result, good)["status"] == "sent"
++    assert result_for(result, broken)["status"] == "failed"
++    assert "Invalid schedule configuration" in runs_for(broken)[0][1]
++    assert recorder.to(sub) == [sub]
++
++    # recorded once per day, not once per minute
++    assert result_for(scan(at(1)), broken) is None
++    assert len(runs_for(broken)) == 1
++
++
++# ---------------------------------------------------------------------------
++# AI workflow
++# ---------------------------------------------------------------------------
++@pytest.fixture()
++def ai_mode(monkeypatch):
++    monkeypatch.setenv("WORKFLOW_MODE", "ai")
++    monkeypatch.setenv("LLM_PROVIDER", "mock")
++
++
++def stub_ai_articles():
++    return [
++        a
++        for a in STUB_ARTICLES
++        if a.source == "spiegel_wissenschaft_technik" and a.topic == "ai_news"
++    ]
++
++
++def test_ai_workflow_runs_and_uses_the_scheduled_article_not_the_first_one(ai_mode, recorder):
++    articles = stub_ai_articles()
++    assert len(articles) >= 2
++    chosen = articles[1]  # deliberately NOT the first article for the topic
++    sub = make_subscriber()
++    nid = make_approved_newsletter(
++        title=chosen.title,
++        body=chosen.body,
++        source=chosen.source,
++        source_external_id=chosen.external_id,
++        source_url=chosen.url,
++    )
++
++    r = client.post(f"/api/workflows/newsletter/{nid}/run-ai")
++    assert r.status_code == 200, r.text  # was: 400 "Topic not set in state"
++    assert r.json()["result"]["ai_send_decision"] == "send"
++    assert recorder.to(sub) == [sub]
++
++    with get_session() as db:
++        assert chosen.title in db.get(Newsletter, nid).title
++        assert articles[0].title not in db.get(Newsletter, nid).title
++    assert newsletter_status(nid) == "sent"
++
++
++def test_ai_low_relevance_is_skipped_without_sending_and_status_is_kept(ai_mode, recorder):
++    sub = make_subscriber()
++    nid = make_approved_newsletter(
++        title="Local bakery wins regional pastry award",
++        body="The bakery was praised for its sourdough and croissants.",
++    )
++
++    r = client.post(f"/api/workflows/newsletter/{nid}/run-ai")
++    assert r.status_code == 200, r.text
++    assert r.json()["result"]["ai_send_decision"] == "skip"
++    assert recorder.to(sub) == []
++    assert newsletter_status(nid) == "skipped"  # not overwritten with "sent"
++
++
++def test_scheduler_reports_a_skipped_ai_decision_honestly(ai_mode, schedules, monkeypatch, recorder):
++    sub = make_subscriber()
++    sid = schedules()
++
++    def irrelevant(db, sources, topics):
++        n = uid("bakery")
++        return NewsArticle(
++            source="spiegel_wissenschaft_technik",
++            external_id=n,
++            url=f"https://example.com/{n}",
++            published_at="2026-08-17T06:00:00+00:00",
++            topic="ai_news",
++            title="Local bakery wins regional pastry award",
++            body="The bakery was praised for its sourdough and croissants.",
++        )
++
++    monkeypatch.setattr(schedule_service, "_first_unseen_article", irrelevant)
++
++    result = result_for(scan(at(0)), sid)
++    assert result["status"] == "skipped_low_relevance"  # was: "sent"
++    assert recorder.to(sub) == []
+diff --git a/tests/backend/test_news_ingestion.py b/tests/backend/test_news_ingestion.py
+index d590050..39bbff0 100644
+--- a/tests/backend/test_news_ingestion.py
++++ b/tests/backend/test_news_ingestion.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++from datetime import datetime, timedelta, timezone
++from email.utils import format_datetime
+ from unittest.mock import Mock, patch
+ 
+ import pytest
+@@ -111,9 +113,25 @@ def test_filter_relevant_articles_keeps_only_ai_matches():
+     assert filtered[0].title == "AI systems are evaluated"
+ 
+ 
++def _fresh_rss_xml() -> bytes:
++    """RSS_XML with publication dates relative to now, so the age filter (default
++    168h) can never silently expire this test again."""
++    now = datetime.now(timezone.utc)
++    xml = RSS_XML.decode("utf-8")
++    xml = xml.replace(
++        "Thu, 20 Aug 2026 10:00:00 GMT",
++        format_datetime(now - timedelta(hours=2), usegmt=True),
++    )
++    xml = xml.replace(
++        "Thu, 20 Aug 2026 11:00:00 GMT",
++        format_datetime(now - timedelta(hours=1), usegmt=True),
++    )
++    return xml.encode("utf-8")
++
++
+ def test_fetch_rss_articles_filters_allowlisted_feed_by_topic():
+     response = Mock()
+-    response.content = RSS_XML
++    response.content = _fresh_rss_xml()
+     response.raise_for_status.return_value = None
+ 
+     with patch(
+diff --git a/tests/backend/test_schedule_execution.py b/tests/backend/test_schedule_execution.py
+index f5bf09b..a025a8b 100644
+--- a/tests/backend/test_schedule_execution.py
++++ b/tests/backend/test_schedule_execution.py
+@@ -144,12 +144,14 @@ def test_due_scan_ignores_not_due_schedule():
+         schedule.delivery_time = "18:00"
+         schedule.timezone = "Europe/Berlin"
+ 
++    # 18:00 Berlin is 16:00 UTC. 16:30 is past the default 15-minute catch-up
++    # window, so this schedule is genuinely not due any more.
+     not_due_time = datetime(
+         2026,
+         8,
+         17,
+         16,
+-        1,
++        30,
+         tzinfo=timezone.utc,
+     )
+ 
+diff --git a/tests/backend/test_scheduler_logic.py b/tests/backend/test_scheduler_logic.py
+index 08df1c8..b68ff5d 100644
+--- a/tests/backend/test_scheduler_logic.py
++++ b/tests/backend/test_scheduler_logic.py
+@@ -48,7 +48,8 @@ def test_not_due_when_minute_does_not_match():
+ 
+     now_utc = datetime(2026, 8, 17, 16, 1, tzinfo=timezone.utc)
+ 
+-    assert is_schedule_due(schedule, now_utc) is False
++    # catchup_minutes=0 is the strict, exact-minute mode.
++    assert is_schedule_due(schedule, now_utc, catchup_minutes=0) is False
+ 
+ 
+ def test_not_due_when_schedule_is_disabled():
+@@ -89,3 +90,79 @@ def test_delivery_window_key_is_local_timezone_based():
+ 
+     assert local_now.hour == 18
+     assert key == "schedule-42-2026-08-17-1800-Europe/Berlin"
++
++
++# --- catch-up window ---------------------------------------------------------
++# 2026-08-17 is a Monday; 18:00 Europe/Berlin (CEST, UTC+2) == 16:00 UTC.
++
++
++def test_due_during_catchup_window_but_not_after_it():
++    schedule = make_schedule(weekdays_json="[0]", delivery_time="18:00")
++
++    def due(hour, minute):
++        now = datetime(2026, 8, 17, hour, minute, 30, tzinfo=timezone.utc)
++        return is_schedule_due(schedule, now, catchup_minutes=15)
++
++    assert due(15, 59) is False  # before the scheduled minute
++    assert due(16, 0) is True  # the scheduled minute itself
++    assert due(16, 7) is True  # a late scan (worker restarted / slow)
++    assert due(16, 15) is True  # last minute of the window
++    assert due(16, 16) is False  # window over
++
++
++def test_zero_catchup_is_exact_minute_only():
++    schedule = make_schedule(weekdays_json="[0]", delivery_time="18:00")
++
++    assert is_schedule_due(
++        schedule, datetime(2026, 8, 17, 16, 0, 59, tzinfo=timezone.utc), catchup_minutes=0
++    )
++    assert not is_schedule_due(
++        schedule, datetime(2026, 8, 17, 16, 1, 0, tzinfo=timezone.utc), catchup_minutes=0
++    )
++
++
++def test_catchup_window_key_is_the_same_for_every_scan_in_the_window():
++    schedule = make_schedule(weekdays_json="[0]", delivery_time="18:00")
++
++    keys = {
++        schedule_delivery_window_key(
++            schedule,
++            datetime(2026, 8, 17, 16, minute, tzinfo=timezone.utc),
++            catchup_minutes=15,
++        )
++        for minute in (0, 3, 9, 15)
++    }
++    assert len(keys) == 1
++
++    next_week = schedule_delivery_window_key(
++        schedule,
++        datetime(2026, 8, 24, 16, 0, tzinfo=timezone.utc),
++        catchup_minutes=15,
++    )
++    assert next_week not in keys
++
++
++def test_catchup_crosses_midnight_and_uses_the_scheduled_day():
++    # Monday 23:58 Berlin == 21:58 UTC. Scan at Tuesday 00:03 Berlin == 22:03 UTC.
++    monday_only = make_schedule(weekdays_json="[0]", delivery_time="23:58")
++    now = datetime(2026, 8, 17, 22, 3, tzinfo=timezone.utc)
++
++    assert is_schedule_due(monday_only, now, catchup_minutes=15) is True
++    assert "2026-08-17" in schedule_delivery_window_key(monday_only, now, catchup_minutes=15)
++
++    # A Tuesday-only schedule must NOT fire for Monday's late-night instance.
++    tuesday_only = make_schedule(weekdays_json="[1]", delivery_time="23:58")
++    assert is_schedule_due(tuesday_only, now, catchup_minutes=15) is False
++
++
++def test_catchup_handles_a_nonexistent_dst_local_time():
++    # Berlin skips 02:00-03:00 on 2026-03-29. "02:30" does not exist that day but
++    # the delivery must still fire exactly once, not crash or double-fire.
++    schedule = make_schedule(weekdays_json="[6]", delivery_time="02:30")  # Sunday
++    first = datetime(2026, 3, 29, 1, 30, 30, tzinfo=timezone.utc)
++    later = datetime(2026, 3, 29, 1, 40, tzinfo=timezone.utc)
++
++    assert is_schedule_due(schedule, first, catchup_minutes=15) is True
++    assert schedule_delivery_window_key(
++        schedule, first, catchup_minutes=15
++    ) == schedule_delivery_window_key(schedule, later, catchup_minutes=15)
+diff --git a/tests/conftest.py b/tests/conftest.py
+index fefb967..2afd18a 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -7,3 +7,17 @@ from pathlib import Path
+ PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ if str(PROJECT_ROOT) not in sys.path:
+     sys.path.insert(0, str(PROJECT_ROOT))
++
++
++import pytest  # noqa: E402
++
++
++@pytest.fixture(scope="session", autouse=True)
++def _ensure_schema():
++    """Tests used to assume the API server had been started once to create tables."""
++    try:
++        from backend.app.db import init_db
++
++        init_db()
++    except Exception:  # noqa: BLE001 - DB-free tests must still run without a database
++        pass
+-- 
+2.43.0
+
