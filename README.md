@@ -87,7 +87,7 @@ curl -X POST http://localhost:8000/api/workflows/newsletter/1/run
 ```
 
 ## 🏗️ Architecture
-
+´´
 ┌─────────────────┐
 │ News Sources │ (RSS feeds, stub data)
 └────────┬────────┘
@@ -112,9 +112,9 @@ curl -X POST http://localhost:8000/api/workflows/newsletter/1/run
 ┌───▼──┐ ┌──▼──────┐
 │ Send │ │ Review │
 └──────┘ └─────────┘
-
+´´
 ## 📁 Project Structure
-
+´´´
 newsletter-orchestrator/
 ├── backend/
 │ ├── app/
@@ -132,7 +132,7 @@ newsletter-orchestrator/
 ├── AI_WORKFLOW_ORCHESTRATION.md # AI workflow docs
 └── README.md # This file
 
-
+´´´
 ## 🔧 Configuration
 
 | Variable | Default | Description |
@@ -232,10 +232,6 @@ curl http://localhost:8000/health
 3. Make your changes
 4. Run tests
 5. Submit a PR
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) file for details.
 
 ## 🙏 Acknowledgments
 
